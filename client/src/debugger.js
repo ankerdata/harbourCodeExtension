@@ -44,7 +44,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
         /** @type{net.socket} */
         this.socket = null;
         /** @type{boolean} */
-        this.Debbugging = true;
+        this.Debugging = true;
         this.sourcePaths = [];
         /** @description the current process line function
          * @type{function(string)} */
@@ -109,7 +109,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
                 this.sendScope(line[8] == 'T')
                 continue;
             }
-            if (line.startsWith("COMPLETITION")) {
+            if (line.startsWith("COMPLETION")) {
                 this.processCompletion(line);
                 continue;
             }
@@ -119,7 +119,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
                     break;
                 }
             }
-            if (j != this.variables.length) continue;
+            if (j >= 0) continue;
         }
     }
 
@@ -868,7 +868,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
         this.sendResponse(resp);
     }
 
-    /// Completition
+    /// Completion
 
     /**
      * @param response{DebugProtocol.CompletionsResponse}
@@ -876,16 +876,16 @@ class harbourDebugSession extends debugadapter.DebugSession {
      */
     completionsRequest(response, args) {
         this.completionsResponse = response;
-        let completitonText = args.text.split(/[\r\n]{1,2}/);
+        let completionText = args.text.split(/[\r\n]{1,2}/);
         if (args.line) {
-            completitonText = completitonText[args.line - 1];
+            completionText = completionText[args.line - 1];
         } else {
-            completitonText = completitonText[0];
+            completionText = completionText[0];
         }
-        completitonText = completitonText.substring(0, args.column - 1);
-        let lastWord = completitonText.match(/[\w\:]+$/i)
-        if (lastWord) completitonText = lastWord[0];
-        this.command(`COMPLETITION\r\n${args.frameId + 1 || this.currentStack}:${completitonText}\r\n`)
+        completionText = completionText.substring(0, args.column - 1);
+        let lastWord = completionText.match(/[\w\:]+$/i)
+        if (lastWord) completionText = lastWord[0];
+        this.command(`COMPLETION\r\n${args.frameId + 1 || this.currentStack}:${completionText}\r\n`)
     }
 
     /**
