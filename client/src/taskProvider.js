@@ -373,7 +373,7 @@ class HBMK2Task {
                     "debugSymbols": true,
                     "output": "${fileBasenameNoExtension}_dbg"
                 }, vscode.TaskScope.Workspace, localize("harbour.task.HBMK2.provideName3") ,"HBMK2");
-                task2.execution = new vscode.CustomExecution(getTerminalFn(task));
+                task2.execution = new vscode.CustomExecution(getTerminalFn(task2));
                 task2.problemMatchers = ["$harbour","$msCompile"];
                 retValue.push(task,task2);
             }
