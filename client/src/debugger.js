@@ -70,56 +70,66 @@ class harbourDebugSession extends debugadapter.DebugSession {
      * @param buff{string} the imported data
      */
     processInput(buff) {
-        var lines = buff.split("\r\n");
-        for (var i = 0; i < lines.length; i++) {
-            var line = lines[i];
-            //if(!line.startsWith("LOG:")) this.sendEvent(new debugadapter.OutputEvent(">>"+line+"\r\n","stdout"))
-            if (line.length == 0) continue;
-            if (this.processLine) {
-                this.processLine(line);
-                continue;
-            }
-            if (line.startsWith("STOP")) {
-                this.sendEvent(new debugadapter.StoppedEvent(line.substring(5), 1));
-                continue;
-            }
-            if (line.startsWith("STACK")) {
-                this.sendStack(line);
-                continue;
-            }
-            if (line.startsWith("BREAK")) {
-                this.processBreak(line);
-                continue;
-            }
-            if (line.startsWith("ERROR") && !line.startsWith("ERROR_VAR")) {
-                //console.log("ERROR")
-                var stopEvt = new debugadapter.StoppedEvent("error", 1, line.substring(6));
-                this.sendEvent(stopEvt);
-                continue;
-            }
-            if (line.startsWith("EXPRESSION")) {
-                this.processExpression(line);
-                continue;
-            }
-            if (line.startsWith("LOG")) {
-                this.sendEvent(new debugadapter.OutputEvent(line.substring(4) + "\r\n", "stdout"))
-                continue;
-            }
-            if (line.startsWith("INERROR")) {
-                this.sendScope(line[8] == 'T')
-                continue;
-            }
-            if (line.startsWith("COMPLETION")) {
-                this.processCompletion(line);
-                continue;
-            }
-            for (var j = this.variables.length - 1; j >= 0; j--) {
-                if (line.startsWith(this.variables[j].command)) {
-                    this.sendVariables(j, line);
-                    break;
+        try {
+            var lines = buff.split("\r\n");
+            for (var i = 0; i < lines.length; i++) {
+                try {
+                    var line = lines[i];
+                    //if(!line.startsWith("LOG:")) this.sendEvent(new debugadapter.OutputEvent(">>"+line+"\r\n","stdout"))
+                    if (line.length == 0) continue;
+                    if (this.processLine) {
+                        this.processLine(line);
+                        continue;
+                    }
+                    if (line.startsWith("STOP")) {
+                        this.sendEvent(new debugadapter.StoppedEvent(line.substring(5), 1));
+                        continue;
+                    }
+                    if (line.startsWith("STACK")) {
+                        this.sendStack(line);
+                        continue;
+                    }
+                    if (line.startsWith("BREAK")) {
+                        this.processBreak(line);
+                        continue;
+                    }
+                    if (line.startsWith("ERROR") && !line.startsWith("ERROR_VAR")) {
+                        //console.log("ERROR")
+                        var stopEvt = new debugadapter.StoppedEvent("error", 1, line.substring(6));
+                        this.sendEvent(stopEvt);
+                        continue;
+                    }
+                    if (line.startsWith("EXPRESSION")) {
+                        this.processExpression(line);
+                        continue;
+                    }
+                    if (line.startsWith("LOG")) {
+                        this.sendEvent(new debugadapter.OutputEvent(line.substring(4) + "\r\n", "stdout"))
+                        continue;
+                    }
+                    if (line.startsWith("INERROR")) {
+                        this.sendScope(line[8] == 'T')
+                        continue;
+                    }
+                    if (line.startsWith("COMPLETION")) {
+                        this.processCompletion(line);
+                        continue;
+                    }
+                    for (var j = this.variables.length - 1; j >= 0; j--) {
+                        if (line.startsWith(this.variables[j].command)) {
+                            this.sendVariables(j, line);
+                            break;
+                        }
+                    }
+                    if (j >= 0) continue;
+                } catch (lineError) {
+                    // Log error but continue processing other lines
+                    this.sendEvent(new debugadapter.OutputEvent(`Error processing line: ${lineError.message}\r\n`, "stderr"));
                 }
             }
-            if (j >= 0) continue;
+        } catch (error) {
+            // Log error but don't crash the debugger
+            this.sendEvent(new debugadapter.OutputEvent(`Debugger error in processInput: ${error.message}\r\n`, "stderr"));
         }
     }
 
@@ -376,9 +386,23 @@ class harbourDebugSession extends debugadapter.DebugSession {
                 tc.socket = socket;
                 socket.removeAllListeners("data");
                 socket.on("data", data => {
-                    tc.processInput(data.toString())
+                    try {
+                        tc.processInput(data.toString())
+                    } catch (error) {
+                        tc.sendEvent(new debugadapter.OutputEvent(`Error processing socket data: ${error.message}\r\n`, "stderr"));
+                    }
                 });
-                socket.write(tc.queue);
+                socket.on("error", error => {
+                    tc.sendEvent(new debugadapter.OutputEvent(`Socket error: ${error.message}\r\n`, "stderr"));
+                });
+                socket.on("close", () => {
+                    tc.socket = null;
+                });
+                try {
+                    socket.write(tc.queue);
+                } catch (error) {
+                    tc.sendEvent(new debugadapter.OutputEvent(`Error writing to socket: ${error.message}\r\n`, "stderr"));
+                }
                 this.justStart = false;
                 tc.queue = "";
             } catch (ex) {
@@ -391,8 +415,16 @@ class harbourDebugSession extends debugadapter.DebugSession {
     command(cmd) {
         if (this.justStart)
             this.queue += cmd;
-        else
-            this.socket.write(cmd);
+        else {
+            if (this.socket && !this.socket.destroyed) {
+                try {
+                    this.socket.write(cmd);
+                } catch (error) {
+                    // Socket write failed, log and continue
+                    this.sendEvent(new debugadapter.OutputEvent(`Debugger error: ${error.message}\r\n`, "stderr"));
+                }
+            }
+        }
     }
 
     /// STACK
@@ -426,52 +458,59 @@ class harbourDebugSession extends debugadapter.DebugSession {
         var frames = [];
         frames.length = nStack;
         var j = 0;
+        var tc = this;
         this.processLine = function (line) {
-            var infos = line.split(":");
-            for (let i = 0; i < infos.length; i++) infos[i] = infos[i].replace(";", ":")
-            var completePath = infos[0]
-            var found = false;
-            if (infos[0].length > 0) {
-                if (path.isAbsolute(infos[0]) && fs.existsSync(infos[0])) {
-                    completePath = infos[0];
-                    found = true;
-                    try {
-                        completePath = trueCase.trueCasePathSync(infos[0]);
-                    } catch (ex) { }
-                } else
-                    for (let i = 0; i < this.sourcePaths.length; i++) {
-                        if (fs.existsSync(path.join(this.sourcePaths[i], infos[0]))) {
-                            completePath = path.join(this.sourcePaths[i], infos[0]);
-                            found = true;
-                            try {
-                                completePath = trueCase.trueCasePathSync(infos[0], this.sourcePaths[i]);
-                            } catch (ex) {
+            try {
+                var infos = line.split(":");
+                for (let i = 0; i < infos.length; i++) infos[i] = infos[i].replace(";", ":")
+                var completePath = infos[0]
+                var found = false;
+                if (infos[0].length > 0) {
+                    if (path.isAbsolute(infos[0]) && fs.existsSync(infos[0])) {
+                        completePath = infos[0];
+                        found = true;
+                        try {
+                            completePath = trueCase.trueCasePathSync(infos[0]);
+                        } catch (ex) { }
+                    } else
+                        for (let i = 0; i < this.sourcePaths.length; i++) {
+                            if (fs.existsSync(path.join(this.sourcePaths[i], infos[0]))) {
+                                completePath = path.join(this.sourcePaths[i], infos[0]);
+                                found = true;
                                 try {
-                                    completePath = trueCase.trueCasePathSync(completePath);
-                                } catch (ex2) { }
+                                    completePath = trueCase.trueCasePathSync(infos[0], this.sourcePaths[i]);
+                                } catch (ex) {
+                                    try {
+                                        completePath = trueCase.trueCasePathSync(completePath);
+                                    } catch (ex2) { }
+                                }
+                                break;
                             }
-                            break;
                         }
-                    }
-            }
-            if (found) infos[0] = path.basename(completePath);
-            frames[j] = new debugadapter.StackFrame(j, infos[2],
-                new debugadapter.Source(infos[0], completePath),
-                parseInt(infos[1]));
-            j++;
-            if (j == nStack) {
-                while (this.stack.length > 0) {
-                    var args = this.stackArgs.shift();
-                    var resp = this.stack.shift();
-                    args.startFrame = args.startFrame || 0;
-                    args.levels = args.levels || frames.length;
-                    args.levels += args.startFrame;
-                    resp.body = {
-                        stackFrames: frames.slice(args.startFrame, args.levels)
-                    };
-                    this.sendResponse(resp);
                 }
+                if (found) infos[0] = path.basename(completePath);
+                frames[j] = new debugadapter.StackFrame(j, infos[2],
+                    new debugadapter.Source(infos[0], completePath),
+                    parseInt(infos[1]));
+                j++;
+                if (j == nStack) {
+                    while (this.stack.length > 0) {
+                        var args = this.stackArgs.shift();
+                        var resp = this.stack.shift();
+                        args.startFrame = args.startFrame || 0;
+                        args.levels = args.levels || frames.length;
+                        args.levels += args.startFrame;
+                        resp.body = {
+                            stackFrames: frames.slice(args.startFrame, args.levels)
+                        };
+                        this.sendResponse(resp);
+                    }
+                    this.processLine = undefined;
+                }
+            } catch (error) {
+                // Clear processLine on error to prevent getting stuck
                 this.processLine = undefined;
+                tc.sendEvent(new debugadapter.OutputEvent(`Error processing stack frame: ${error.message}\r\n`, "stderr"));
             }
         }
     }
@@ -611,38 +650,50 @@ class harbourDebugSession extends debugadapter.DebugSession {
 
     sendVariables(id, line) {
         var vars = [];
+        var tc = this;
         this.processLine = function (line) {
-            if (line.startsWith("END")) {
-                var resp = this.variables[id].response
-                resp.body = {
-                    variables: vars
-                };
-                this.sendResponse(resp);
-                this.processLine = undefined;
-                return;
-            }
-            var infos = line.split(":");
-            if (infos[0] == "AREA") {
-                // workareas
-                // AREA:Alias:Area:fCount:recno:reccount:scope:
-                //   0    1    2     3       4     5       6
-                var value = "AREA " + infos[2];
-                var v = new debugadapter.Variable(infos[1], value);
-                v.indexedVariables = 4; //recno-recCount-Scope-Fields
-                this.areasInfos[parseInt(infos[2])] = infos;
-                //parseInt(infos[3])
-                v.variablesReference = this.getVarReference("AREA" + infos[2], infos[1] + "->")
-                //v = this.getVariableFormat(v,infos[5],infos[6],"value",line,id);
+            try {
+                if (line.startsWith("END")) {
+                    var resp = this.variables[id].response
+                    resp.body = {
+                        variables: vars
+                    };
+                    this.sendResponse(resp);
+                    this.processLine = undefined;
+                    return;
+                }
+                var infos = line.split(":");
+                if (infos[0] == "AREA") {
+                    // workareas
+                    // AREA:Alias:Area:fCount:recno:reccount:scope:
+                    //   0    1    2     3       4     5       6
+                    var value = "AREA " + infos[2];
+                    var v = new debugadapter.Variable(infos[1], value);
+                    v.indexedVariables = 4; //recno-recCount-Scope-Fields
+                    this.areasInfos[parseInt(infos[2])] = infos;
+                    //parseInt(infos[3])
+                    v.variablesReference = this.getVarReference("AREA" + infos[2], infos[1] + "->")
+                    //v = this.getVariableFormat(v,infos[5],infos[6],"value",line,id);
+                    vars.push(v);
+                    return
+                }
+                line = infos[0] + ":" + infos[1] + ":" + infos[2] + ":" + infos[3];
+                if (infos.length > 7) { //the value can contains : , we need to rejoin it.
+                    infos[6] = infos.splice(6).join(":");
+                }
+                var v = new debugadapter.Variable(infos[4], infos[6]);
+                v = this.getVariableFormat(v, infos[5], infos[6], "value", line, id);
                 vars.push(v);
-                return
+            } catch (error) {
+                // Clear processLine on error to prevent getting stuck
+                this.processLine = undefined;
+                tc.sendEvent(new debugadapter.OutputEvent(`Error processing variable: ${error.message}\r\n`, "stderr"));
+                // Try to send response even on error to unblock the debugger
+                if (this.variables[id] && this.variables[id].response) {
+                    this.variables[id].response.body = { variables: vars };
+                    this.sendResponse(this.variables[id].response);
+                }
             }
-            line = infos[0] + ":" + infos[1] + ":" + infos[2] + ":" + infos[3];
-            if (infos.length > 7) { //the value can contains : , we need to rejoin it.
-                infos[6] = infos.splice(6).join(":");
-            }
-            var v = new debugadapter.Variable(infos[4], infos[6]);
-            v = this.getVariableFormat(v, infos[5], infos[6], "value", line, id);
-            vars.push(v);
         }
     }
 
@@ -735,37 +786,44 @@ class harbourDebugSession extends debugadapter.DebugSession {
     }
 
     processBreak(line) {
-        //this.sendEvent(new debugadapter.OutputEvent("received: "+line+"\r\n","console"))
-        var aInfos = line.split(":");
-        var dest
-        if (!(aInfos[1] in this.breakpoints)) {
-            //error
-            return
-        }
-        aInfos[2] = parseInt(aInfos[2]);
-        aInfos[3] = parseInt(aInfos[3]);
-        dest = this.breakpoints[aInfos[1]]
-        var idBreak = dest.response.body.breakpoints.findIndex(b => b.line == aInfos[2]);
-        if (idBreak == -1) {
-            if (aInfos[2] in dest) {
-                delete dest[aInfos[2]];
-                this.checkBreakPoint(aInfos[1]);
+        try {
+            //this.sendEvent(new debugadapter.OutputEvent("received: "+line+"\r\n","console"))
+            var aInfos = line.split(":");
+            var dest
+            if (aInfos.length < 2 || !(aInfos[1] in this.breakpoints)) {
+                //error
+                return
             }
-            return;
+            aInfos[2] = parseInt(aInfos[2]);
+            aInfos[3] = parseInt(aInfos[3]);
+            dest = this.breakpoints[aInfos[1]]
+            if (!dest || !dest.response || !dest.response.body || !dest.response.body.breakpoints) {
+                return;
+            }
+            var idBreak = dest.response.body.breakpoints.findIndex(b => b.line == aInfos[2]);
+            if (idBreak == -1) {
+                if (aInfos[2] in dest) {
+                    delete dest[aInfos[2]];
+                    this.checkBreakPoint(aInfos[1]);
+                }
+                return;
+            }
+            if (aInfos[3] > 1) {
+                dest.response.body.breakpoints[idBreak].line = aInfos[3];
+                dest.response.body.breakpoints[idBreak].verified = true;
+                dest[aInfos[2]] = 1;
+            } else {
+                dest.response.body.breakpoints[idBreak].verified = false;
+                if (aInfos[4] == 'notfound')
+                    dest.response.body.breakpoints[idBreak].message = localize('harbour.dbgNoModule')
+                else
+                    dest.response.body.breakpoints[idBreak].message = localize('harbour.dbgNoLine')
+                dest[aInfos[2]] = 1;
+            }
+            this.checkBreakPoint(aInfos[1]);
+        } catch (error) {
+            this.sendEvent(new debugadapter.OutputEvent(`Error processing breakpoint: ${error.message}\r\n`, "stderr"));
         }
-        if (aInfos[3] > 1) {
-            dest.response.body.breakpoints[idBreak].line = aInfos[3];
-            dest.response.body.breakpoints[idBreak].verified = true;
-            dest[aInfos[2]] = 1;
-        } else {
-            dest.response.body.breakpoints[idBreak].verified = false;
-            if (aInfos[4] == 'notfound')
-                dest.response.body.breakpoints[idBreak].message = localize('harbour.dbgNoModule')
-            else
-                dest.response.body.breakpoints[idBreak].message = localize('harbour.dbgNoLine')
-            dest[aInfos[2]] = 1;
-        }
-        this.checkBreakPoint(aInfos[1]);
     }
 
     checkBreakPoint(src) {
@@ -852,20 +910,28 @@ class harbourDebugSession extends debugadapter.DebugSession {
      * @param line{string} the income line
      */
     processExpression(line) {
-        // EXPRESSION:{frame}:{type}:{result}
-        var infos = line.split(":");
-        if (infos.length > 4) { //the value can contains : , we need to rejoin it.
-            infos[3] = infos.splice(3).join(":");
+        try {
+            // EXPRESSION:{frame}:{type}:{result}
+            var infos = line.split(":");
+            if (infos.length > 4) { //the value can contains : , we need to rejoin it.
+                infos[3] = infos.splice(3).join(":");
+            }
+            var resp = this.evaluateResponses.shift();
+            if (!resp) {
+                this.sendEvent(new debugadapter.OutputEvent(`No response found for expression evaluation\r\n`, "stderr"));
+                return;
+            }
+            var line = "EXP:" + infos[1] + ":" + resp.body.result.replace(/:/g, ";") + ":";
+            resp.body.name = resp.body.result
+            if (infos[2] == "E") {
+                resp.success = false;
+                resp.message = infos[3];
+            } else
+                resp.body = this.getVariableFormat(resp.body, infos[2], infos[3], "result", line);
+            this.sendResponse(resp);
+        } catch (error) {
+            this.sendEvent(new debugadapter.OutputEvent(`Error processing expression: ${error.message}\r\n`, "stderr"));
         }
-        var resp = this.evaluateResponses.shift();
-        var line = "EXP:" + infos[1] + ":" + resp.body.result.replace(/:/g, ";") + ":";
-        resp.body.name = resp.body.result
-        if (infos[2] == "E") {
-            resp.success = false;
-            resp.message = infos[3];
-        } else
-            resp.body = this.getVariableFormat(resp.body, infos[2], infos[3], "result", line);
-        this.sendResponse(resp);
     }
 
     /// Completion
@@ -892,25 +958,38 @@ class harbourDebugSession extends debugadapter.DebugSession {
      * @param line{string}
      */
     processCompletion() {
+        var tc = this;
         this.processLine = function (line) {
-            if (line == "END") {
-                this.sendResponse(this.completionsResponse);
+            try {
+                if (line == "END") {
+                    this.sendResponse(this.completionsResponse);
+                    this.processLine = undefined;
+                    return;
+                }
+                if (!this.completionsResponse.body) this.completionsResponse.body = {};
+                if (!this.completionsResponse.body.targets) this.completionsResponse.body.targets = [];
+                var type = line.substr(0, line.indexOf(":"));
+                line = line.substr(line.indexOf(":") + 1);
+                var thisCompletion = new debugadapter.CompletionItem(line, 0);
+                thisCompletion.type = type == "F" ? 'function' :
+                    type == "M" ? 'field' :
+                        type == "D" ? 'variable' : 'value';
+                // function/procedure -> function
+                // method -> field
+                // data -> variable
+                // local/public/etc -> value
+                this.completionsResponse.body.targets.push(thisCompletion);
+            } catch (error) {
+                // Clear processLine on error to prevent getting stuck
                 this.processLine = undefined;
-                return;
+                tc.sendEvent(new debugadapter.OutputEvent(`Error processing completion: ${error.message}\r\n`, "stderr"));
+                // Try to send response even on error to unblock the debugger
+                if (this.completionsResponse) {
+                    if (!this.completionsResponse.body) this.completionsResponse.body = {};
+                    if (!this.completionsResponse.body.targets) this.completionsResponse.body.targets = [];
+                    this.sendResponse(this.completionsResponse);
+                }
             }
-            if (!this.completionsResponse.body) this.completionsResponse.body = {};
-            if (!this.completionsResponse.body.targets) this.completionsResponse.body.targets = [];
-            var type = line.substr(0, line.indexOf(":"));
-            line = line.substr(line.indexOf(":") + 1);
-            var thisCompletion = new debugadapter.CompletionItem(line, 0);
-            thisCompletion.type = type == "F" ? 'function' :
-                type == "M" ? 'field' :
-                    type == "D" ? 'variable' : 'value';
-            // function/procedure -> function
-            // method -> field
-            // data -> variable
-            // local/public/etc -> value
-            this.completionsResponse.body.targets.push(thisCompletion);
         }
     }
 }
