@@ -1,0 +1,83 @@
+name: Build and Release Extension
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install server dependencies
+        run: |
+          cd server
+          npm install
+
+      - name: Build server
+        run: |
+          cd server
+          npm run webpack2
+
+      - name: Install client dependencies
+        run: |
+          cd client
+          npm install
+
+      - name: Build client
+        run: |
+          cd client
+          npm run webpack2
+
+      - name: Run prepublish script
+        run: |
+          cd client
+          npm run vscode:prepublish
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Package extension
+        run: |
+          cd client
+          vsce package --out ../harbour-extension.vsix
+
+      - name: Get version from package.json
+        id: get_version
+        run: |
+          VERSION=$(node -p "require('./client/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: harbour-extension.vsix
+          tag_name: ${{ steps.get_version.outputs.tag }}
+          name: Release ${{ steps.get_version.outputs.tag }}
+          body: |
+            ## Harbour Code Extension ${{ steps.get_version.outputs.version }}
+            
+            Automated release from master branch.
+            
+            ### Installation
+            Download the `.vsix` file and install it using:
+            ```
+            code --install-extension harbour-extension.vsix
+            ```
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
