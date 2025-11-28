@@ -93,7 +93,7 @@ function DebugList(args) {
 				resolve("");
 		})
 
-		picks.show();;
+		picks.show();
 	});
 }
 
