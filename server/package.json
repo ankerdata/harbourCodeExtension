@@ -28,7 +28,7 @@
     "webpack-cli": "^4.10.0"
   },
   "scripts": {
-    "prelanch": "webpack --mode development",
+    "prelaunch": "webpack --mode development",
     "webpack2": "webpack --mode production"
   }
 }
