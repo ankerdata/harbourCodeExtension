@@ -1,13 +1,13 @@
 {
-    "name": "harbour",
-    "displayName": "Harbour and xHarbour",
+    "name": "harbour-ankerdata",
+    "displayName": "Harbour and xHarbour (Ankerdata)",
     "description": "Harbour and xHarbour languages support for visual studio code",
     "version": "1.0.7",
-    "publisher": "aperricone",
+    "publisher": "ankerdata",
     "icon": "harbourIcon.png",
     "main": "./dist/extension",
     "repository": {
-        "url": "https://github.com/APerricone/harbourCodeExtension"
+        "url": "https://github.com/ankerdata/harbourCodeExtension"
     },
     "activationEvents": [
         "onLanguage:harbour",

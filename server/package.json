@@ -1,15 +1,15 @@
 {
-  "name": "harbour-lang-server",
+  "name": "harbour-lang-server-ankerdata",
   "description": "Server part of Harbour language support for visual studio code.",
   "version": "0.6.0",
-  "author": "aperricone",
+  "author": "ankerdata",
   "main": "dist/hb_server.js",
   "bin": {
     "hbLanguageServer": "dist/hb_server.js"
   },
   "license": "GPL",
   "repository": {
-    "url": "https://github.com/APerricone/harbourCodeExtension"
+    "url": "https://github.com/ankerdata/harbourCodeExtension"
   },
   "engines": {
     "node": "*"
