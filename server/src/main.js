@@ -207,7 +207,7 @@ function parseWorkspace() {
             // 2nd cycle: parse all c file
             for (let i = 0; i < files.length; i++) {
                 let dest = files[i];
-                if(dest.cMode && (prgFiles.findIndex((v) => v.indexOf(dest.pathParse.name) >= 0) >= 0)) {
+                if(dest.cFile && (prgFiles.findIndex((v) => v.indexOf(dest.pathParse.name) >= 0) >= 0)) {
                     appendFile(dest.completePath, true)
                 }
             }
@@ -562,7 +562,7 @@ function GetWord(params, withPrev) {
                 while(idx>=0 && (prev==' ' || prev=='\t')) {
                     prev = text[--idx];
                 }
-                let canBreak = (prev!=' ' || prev!='\t')
+                let canBreak = (prev!=' ' && prev!='\t')
                 if(prev==">") {
                     canBreak=idx>0;
                     if(canBreak)
@@ -691,7 +691,7 @@ connection.onDefinition((params) => {
         pp = ParseInclude(startDir, includes[i], thisDone);
         if (pp) {
             DoProvider(pp, pp.currentDocument)
-            for (var j = 0; j < pp.includes; j++) {
+            for (var j = 0; j < pp.includes.length; j++) {
                 if (includes.indexOf(pp.includes[j]) < 0)
                     includes.push(pp.includes[j]);
             }
@@ -1113,7 +1113,7 @@ connection.onCompletion((param, cancelled) => {
             pInc = ParseInclude(startDir, includes[i], thisDone);
             if (pInc) {
                 GetCompletions(pInc, pInc.currentDocument)
-                for (var j = 0; j < pInc.includes; j++) {
+                for (var j = 0; j < pInc.includes.length; j++) {
                     if (includes.indexOf(pInc.includes[j]) < 0)
                         includes.push(pInc.includes[j]);
                 }
@@ -1484,7 +1484,7 @@ connection.onFoldingRanges((params) => {
     for (let iComment = 0; iComment < pp.multilineComments.length; iComment++) {
         const cc = pp.multilineComments[iComment];
         var rr = {};
-        rr.king = "comment"
+        rr.kind = "comment"
         rr.startLine = cc[0];
         rr.endLine = cc[1];
         ranges.push(rr);
