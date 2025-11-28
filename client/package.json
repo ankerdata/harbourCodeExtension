@@ -35,7 +35,7 @@
     },
     "scripts": {
         "vscode:prepublish": "node copy.js",
-        "prelanch": "webpack --mode development",
+        "prelaunch": "webpack --mode development",
         "webpack2": "webpack --mode production"
     },
     "contributes": {
