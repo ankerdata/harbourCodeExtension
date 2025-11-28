@@ -61,7 +61,7 @@ jobs:
           echo "tag=v$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create or Update Release
-        uses: ncipollo/create-release@v1
+        uses: ncipollo/release-action@v1
         with:
           artifacts: harbour-extension.vsix
           tag: ${{ steps.get_version.outputs.tag }}
