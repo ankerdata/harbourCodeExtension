@@ -303,7 +303,7 @@ Provider.prototype.linePP = function (line) {
         }
     }
     if (line.trim().length == 0) {
-        if(justStart) this.resetComments()
+        if(!this.cont) this.resetComments()
         this.lineStates.push(new lineState(this.cMode? 1 : 0))
         return "";
     }
