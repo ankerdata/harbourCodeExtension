@@ -20,10 +20,7 @@ const config = {
     vscode: 'commonjs vscode'
   },
   resolve: {
-    extensions: ['.js'],
-    alias: {
-      '@yagisumi/win-output-debug-string': path.join(__dirname,'node_modules/@yagisumi/win-output-debug-string/build/Release/win_output_debug_string.node')
-    }
+    extensions: ['.js']
   },
   module: {
     rules: [

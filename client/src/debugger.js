@@ -10,7 +10,11 @@ const trueCase = require("true-case-path");
 const platform = require("os").platform();
 var winMonitor = undefined;
 if(platform=="win32") {
-    winMonitor = require("@yagisumi/win-output-debug-string").monitor;
+    try {
+        winMonitor = require("@yagisumi/win-output-debug-string").monitor;
+    } catch (e) {
+        winMonitor = undefined;
+    }
 }
 
 // https://code.visualstudio.com/updates/v1_30#:~:text=Finalized%20Debug%20Adapter%20Tracker%20API
