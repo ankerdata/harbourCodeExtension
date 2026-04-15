@@ -30,7 +30,7 @@ class HBVar {
      **/
     constructor(command) {
         this.command = command
-        this.response = undefined;
+        this.responses = [];
         this.evaluation = ""
     }
 }
@@ -61,6 +61,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
         /** @type{string} */
         this.queue = "";
         this.evaluateResponses = [];
+        this.scopeResponses = [];
         /** @type{DebugProtocol.CompletionsResponse} */
         this.completionsResponse = undefined;
         this.areasInfos = [];
@@ -459,12 +460,11 @@ class harbourDebugSession extends debugadapter.DebugSession {
      * @param args{DebugProtocol.StackTraceArguments} arguments
      */
     stackTraceRequest(response, args) {
-        // reset references
-        this.variables = [];
-        this.variablesMap.clear();
-
-        if (this.stack.length == 0)
+        if (this.stack.length == 0) {
+            this.variables = [];
+            this.variablesMap.clear();
             this.command("STACK\r\n");
+        }
         this.stack.push(response);
         this.stackArgs.push(args);
     }
@@ -559,7 +559,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
         // save wanted stack
         this.currentStack = args.frameId + 1;
 
-        this.scopeResponse = response
+        this.scopeResponses.push(response);
         this.command("INERROR\r\n")
     }
 
@@ -590,7 +590,11 @@ class harbourDebugSession extends debugadapter.DebugSession {
             new debugadapter.Scope("Statics", ++n),
             new debugadapter.Scope("Workareas", ++n)
         );
-        const response = this.scopeResponse;
+        const response = this.scopeResponses.shift();
+        if (!response) {
+            this.sendEvent(new debugadapter.OutputEvent(`No response found for scopes request\r\n`, "stderr"));
+            return;
+        }
         response.body = { scopes: scopes };
         this.sendResponse(response)
     }
@@ -639,7 +643,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
                 this.sendAreaHeaders(response, cmd);
                 return;
             }
-            this.variables[args.variablesReference - 1].response = response;
+            this.variables[args.variablesReference - 1].responses.push(response);
             this.command(`${cmd}\r\n${this.currentStack}:${hbStart}:${hbCount}\r\n`);
         } else
             this.sendResponse(response);
@@ -708,11 +712,13 @@ class harbourDebugSession extends debugadapter.DebugSession {
         this.processLine = function (line) {
             try {
                 if (line.startsWith("END")) {
-                    const resp = tc.variables[id].response;
-                    resp.body = {
-                        variables: vars
-                    };
-                    tc.sendResponse(resp);
+                    const resp = tc.variables[id].responses.shift();
+                    if (resp) {
+                        resp.body = {
+                            variables: vars
+                        };
+                        tc.sendResponse(resp);
+                    }
                     tc.processLine = undefined;
                     return;
                 }
@@ -743,9 +749,10 @@ class harbourDebugSession extends debugadapter.DebugSession {
                 tc.processLine = undefined;
                 tc.sendEvent(new debugadapter.OutputEvent(`Error processing variable: ${error.message}\r\n`, "stderr"));
                 // Try to send response even on error to unblock the debugger
-                if (tc.variables[id] && tc.variables[id].response) {
-                    tc.variables[id].response.body = { variables: vars };
-                    tc.sendResponse(tc.variables[id].response);
+                if (tc.variables[id] && tc.variables[id].responses && tc.variables[id].responses.length > 0) {
+                    const resp = tc.variables[id].responses.shift();
+                    resp.body = { variables: vars };
+                    tc.sendResponse(resp);
                 }
             }
         }
@@ -957,7 +964,8 @@ class harbourDebugSession extends debugadapter.DebugSession {
         response.body = {};
         response.body.result = args.expression;
         this.evaluateResponses.push(response);
-        this.command(`EXPRESSION\r\n${args.frameId + 1 || this.currentStack}:${args.expression.replace(/:/g, ";")}\r\n`)
+        const frameId = Number.isInteger(args.frameId) ? args.frameId + 1 : this.currentStack;
+        this.command(`EXPRESSION\r\n${frameId}:${args.expression.replace(/:/g, ";")}\r\n`)
     }
 
     /**
@@ -974,7 +982,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
             
             const frame = line.substring(11, colonIndex1);
             const type = line.substring(colonIndex1 + 1, colonIndex2);
-            const result = colonIndex3 >= 0 ? line.substring(colonIndex2 + 1) : line.substring(colonIndex2 + 1);
+            const result = colonIndex3 >= 0 ? line.substring(colonIndex2 + 1, colonIndex3) : line.substring(colonIndex2 + 1);
             
             const resp = this.evaluateResponses.shift();
             if (!resp) {
@@ -986,6 +994,7 @@ class harbourDebugSession extends debugadapter.DebugSession {
             if (type == "E") {
                 resp.success = false;
                 resp.message = result;
+                resp.body = undefined;
             } else
                 resp.body = this.getVariableFormat(resp.body, type, result, "result", expLine);
             this.sendResponse(resp);
