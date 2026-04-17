@@ -134,20 +134,34 @@ connection.onInitialize(params => {
         }
     }
 });
+connection.onInitialized(() => {
+    // When no onDidChangeConfiguration is received (e.g. Neovim),
+    // parse the workspace with a default depth so go-to-definition
+    // and other cross-file features work immediately.
+    if (workspaceDepth === undefined) {
+        includeDirs = ["."];
+        workspaceDepth = 3;
+        parseWorkspace();
+    }
+});
 /*
 connection.workspace.onDidChangeWorkspaceFolders(params=>{
     var i=0;
 })
 */
 connection.onDidChangeConfiguration(params => {
-    var searchExclude = params.settings.search.exclude;
+    if (!params.settings) return;
+    var searchExclude = params.settings.search && params.settings.search.exclude;
     // minimatch
-    wordBasedSuggestions = params.settings.editor.wordBasedSuggestions
-    currStyleConfig = params.settings.harbour.formatter;
+    if (params.settings.editor) wordBasedSuggestions = params.settings.editor.wordBasedSuggestions;
+    if (params.settings.harbour && params.settings.harbour.formatter) currStyleConfig = params.settings.harbour.formatter;
     var oldDepth = workspaceDepth;
-    includeDirs = params.settings.harbour.extraIncludePaths;
-    includeDirs.splice(0, 0, ".")
-    workspaceDepth = params.settings.harbour.workspaceDepth;
+    if (params.settings.harbour && params.settings.harbour.extraIncludePaths) {
+        includeDirs = params.settings.harbour.extraIncludePaths;
+        includeDirs.splice(0, 0, ".");
+    }
+    if (params.settings.harbour && params.settings.harbour.workspaceDepth !== undefined)
+        workspaceDepth = params.settings.harbour.workspaceDepth;
     if(workspaceDepth!=oldDepth)
         parseWorkspace();
 })
@@ -1398,31 +1412,151 @@ connection.onHover((params, cancelled) => {
     var doc = documents.get(params.textDocument.uri);
     var pp = getDocumentProvider(doc);
     if(w.length==0) return undefined;
+    var wLower = w.toLowerCase();
+
+    // Search for #define macros first (current file, then includes)
     if (pp) {
         var result = pp.funcList.filter((v)=> v.kind=='define' && v.name==w);
         if(result.length>0) {
             return { contents: { language: 'harbour', value: result[0].body } };
         }
-        var thisDone = doc.uri in files;
-        var includes = pp.includes;
+    }
+    var thisDone = doc.uri in files;
+    if (pp) {
+        var incList = pp.includes.slice();
         var i = 0;
         var startDir = path.dirname(Uri.parse(doc.uri).fsPath);
-        while (i < includes.length) {
-            var pInc = ParseInclude(startDir, includes[i], thisDone);
+        while (i < incList.length) {
+            var pInc = ParseInclude(startDir, incList[i], thisDone);
             if (pInc) {
                 var result = pInc.funcList.filter((v)=> v.kind=='define' && v.name==w);
                 if(result.length>0) {
                     return { contents: { language: 'harbour', value: result[0].body } };
                 }
                 for (var j = 0; j < pInc.includes.length; j++) {
-                    if (includes.indexOf(pInc.includes[j]) < 0)
-                        includes.push(pInc.includes[j]);
+                    if (incList.indexOf(pInc.includes[j]) < 0)
+                        incList.push(pInc.includes[j]);
                 }
             }
             i++;
             if (cancelled.isCancellationRequested) return undefined;
         }
     }
+
+    // Build hover info for functions, procedures, methods, classes, and variables
+    function buildHoverForInfo(info, pp) {
+        var label = "";
+        switch (info.kind) {
+            case "function":
+            case "function*":
+                label = "FUNCTION " + info.name;
+                break;
+            case "procedure":
+            case "procedure*":
+                label = "PROCEDURE " + info.name;
+                break;
+            case "method":
+                label = "METHOD " + info.name;
+                if (info.parent) label += " CLASS " + info.parent.name;
+                else if (info.parentName) label += " CLASS " + info.parentName;
+                break;
+            case "class":
+                label = "CLASS " + info.name;
+                break;
+            case "data":
+                label = "DATA " + info.name;
+                if (info.parent) label += " (CLASS " + info.parent.name + ")";
+                break;
+            case "C-FUNC":
+                label = "HB_FUNC(" + info.name + ")";
+                break;
+            case "local":
+            case "static":
+            case "public":
+            case "private":
+            case "memvar":
+            case "param":
+                label = info.kind.toUpperCase() + " " + info.name;
+                if (info.parent) label += " (" + info.parent.name + ")";
+                break;
+            default:
+                return undefined;
+        }
+        // Append parameter list for functions/procedures/methods
+        if (info.kind.startsWith("function") || info.kind.startsWith("procedure") || info.kind == "method") {
+            var idx = pp.funcList.indexOf(info);
+            if (idx >= 0) {
+                var params = [];
+                for (var ip = idx + 1; ip < pp.funcList.length; ip++) {
+                    var sub = pp.funcList[ip];
+                    if (sub.parent == info && sub.kind == "param")
+                        params.push(sub.name);
+                    else
+                        break;
+                }
+                label += "(" + params.join(", ") + ")";
+            }
+        }
+        // Check for $DOC$ documentation
+        if ("hDocIdx" in info) {
+            var hDoc = pp.harbourDocs[info.hDocIdx];
+            if (hDoc) {
+                var docText = label;
+                if (hDoc.documentation) docText += "\n\n" + hDoc.documentation;
+                if (hDoc.return) docText += "\n\nReturns: " + (hDoc.return.help || hDoc.return.name);
+                return { contents: { kind: 'markdown', value: "```harbour\n" + label + "\n```" + (hDoc.documentation ? "\n\n" + hDoc.documentation : "") + (hDoc.return ? "\n\n**Returns:** " + (hDoc.return.help || hDoc.return.name) : "") } };
+            }
+        }
+        var contents = "```harbour\n" + label + "\n```";
+        if (info.comment && info.comment.trim().length > 0)
+            contents += "\n\n" + info.comment.trim();
+        return { contents: { kind: 'markdown', value: contents } };
+    }
+
+    // Search current file for definitions
+    if (pp) {
+        for (var i = 0; i < pp.funcList.length; i++) {
+            var info = pp.funcList[i];
+            if (info.nameCmp != wLower) continue;
+            if (info.foundLike != "definition") continue;
+            // For locals/params, check scope
+            if (info.kind == "local" || info.kind == "param") {
+                if (info.parent) {
+                    if (info.parent.startLine > params.position.line) continue;
+                    if (info.parent.endLine < params.position.line) continue;
+                }
+            }
+            var hover = buildHoverForInfo(info, pp);
+            if (hover) return hover;
+        }
+    }
+
+    // Search workspace files for definitions
+    for (var file in files) {
+        if (file == doc.uri) continue;
+        var fpp = files[file];
+        for (var i = 0; i < fpp.funcList.length; i++) {
+            var info = fpp.funcList[i];
+            if (info.nameCmp != wLower) continue;
+            if (info.foundLike != "definition") continue;
+            if (info.kind.endsWith("*")) continue; // static, skip cross-file
+            if (info.kind == "local" || info.kind == "param" || info.kind == "static") continue;
+            var hover = buildHoverForInfo(info, fpp);
+            if (hover) return hover;
+        }
+        if (cancelled.isCancellationRequested) return undefined;
+    }
+
+    // Search standard library docs
+    for (var i = 0; i < docs.length; i++) {
+        if (docs[i].name.toLowerCase() == wLower) {
+            var label = docs[i].label || docs[i].name;
+            var contents = "```harbour\n" + label + "\n```";
+            if (docs[i].documentation) contents += "\n\n" + docs[i].documentation;
+            return { contents: { kind: 'markdown', value: contents } };
+        }
+    }
+
     return undefined;
 })
 
