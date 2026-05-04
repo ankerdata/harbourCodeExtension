@@ -122,16 +122,22 @@ class harbourDebugSession extends debugadapter.DebugSession {
                         this.processCompletion(line);
                         continue;
                     }
-                    // Optimized: Use Map for O(1) lookup instead of linear search
-                    let foundVar = false;
+                    // Pick the LONGEST registered command that prefixes this line.
+                    // Nested-variable commands ("LOC:1:5:1") share a prefix with their
+                    // parents ("LOC:1:5:"), so a first-match loop would mis-route the
+                    // child's echo to the parent and the expand-click would do nothing.
+                    let longestVarIndex = -1;
+                    let longestLen = -1;
                     for (const [command, varIndex] of this.variablesMap.entries()) {
-                        if (line.startsWith(command)) {
-                            this.sendVariables(varIndex, line);
-                            foundVar = true;
-                            break;
+                        if (command.length > longestLen && line.startsWith(command)) {
+                            longestLen = command.length;
+                            longestVarIndex = varIndex;
                         }
                     }
-                    if (foundVar) continue;
+                    if (longestVarIndex >= 0) {
+                        this.sendVariables(longestVarIndex, line);
+                        continue;
+                    }
                 } catch (lineError) {
                     // Log error but continue processing other lines
                     this.sendEvent(new debugadapter.OutputEvent(`Error processing line: ${lineError.message}\r\n`, "stderr"));
