@@ -977,14 +977,14 @@ class harbourDebugSession extends debugadapter.DebugSession {
     processExpression(line) {
         try {
             // EXPRESSION:{frame}:{type}:{result}
-            // Optimized: Use split with limit for better performance
+            // result is the last field and may itself contain ':' (e.g. Windows paths),
+            // so take everything after the third ':' verbatim.
             const colonIndex1 = line.indexOf(":", 11); // After "EXPRESSION:"
             const colonIndex2 = line.indexOf(":", colonIndex1 + 1);
-            const colonIndex3 = line.indexOf(":", colonIndex2 + 1);
-            
+
             const frame = line.substring(11, colonIndex1);
             const type = line.substring(colonIndex1 + 1, colonIndex2);
-            const result = colonIndex3 >= 0 ? line.substring(colonIndex2 + 1, colonIndex3) : line.substring(colonIndex2 + 1);
+            const result = line.substring(colonIndex2 + 1);
             
             const resp = this.evaluateResponses.shift();
             if (!resp) {
