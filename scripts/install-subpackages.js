@@ -7,23 +7,22 @@
 // would miss its native module. Per-subpackage installs keep each
 // node_modules tree isolated and make `vsce package` deterministic.
 
-const { spawnSync } = require('child_process');
+const { execSync } = require('child_process');
 const path = require('path');
 
 const repoRoot = path.resolve(__dirname, '..');
 const targets = ['client', 'server'];
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
+// Use execSync (always shells out) so this works uniformly on POSIX and on
+// Windows — where `npm` is `npm.cmd` and Node 22+ refuses to spawn() it
+// directly. execSync inherits stdio and throws on non-zero exit.
 for (const target of targets) {
   const cwd = path.join(repoRoot, target);
   console.log(`[install] ${target}`);
-  const result = spawnSync(npm, ['install'], {
-    cwd,
-    stdio: 'inherit',
-    shell: false,
-  });
-  if (result.status !== 0) {
-    console.error(`[install] failed in ${target} (exit ${result.status})`);
-    process.exit(result.status ?? 1);
+  try {
+    execSync('npm install', { cwd, stdio: 'inherit' });
+  } catch (err) {
+    console.error(`[install] failed in ${target}: ${err.message}`);
+    process.exit(err.status ?? 1);
   }
 }
