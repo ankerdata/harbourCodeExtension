@@ -1712,13 +1712,13 @@ connection.onRequest("harbour/docSnippet", (params) => {
 
 connection.onRequest(server.SemanticTokensRequest.method, (param) => {
     var doc = documents.get(param.textDocument.uri);
-    if(!doc) return [];
+    if(!doc) return { data: [] };
     var ret = [];
     var pp// = getDocumentProvider(doc);
     if (doc.uri in files)
         pp = files[doc.uri]
     else
-        return [] // does not parse unknown files
+        return { data: [] } // does not parse unknown files
     for (let i = 0; i < pp.funcList.length; i++) {
         /** @type{provider.Info} */
         const info = pp.funcList[i];
