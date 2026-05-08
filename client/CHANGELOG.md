@@ -1,6 +1,13 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.0.9
+ - **Server** migrated to TypeScript with `strictNullChecks` for stronger compile-time safety; esbuild compiles `.ts` directly so the shipped bundle is byte-equivalent
+ - **Server** fixed duplicate references and definitions when an LSP client sends a different URI form than the server synthesizes (surfaced on Windows + Neovim, where the client used `file:///C:/foo` while the server used `file:///c%3A/foo`); all URIs are now canonicalized at every entry point
+ - **Tests** added a Jest test suite under `server/test/` covering parser output for representative `.prg` fixtures, definition lookup, hover data, and semantic-token computation
+ - **CI** server tests now run on every push and PR across Linux and Windows
+ - **Tests** removed the broken `server/test_parse.js` one-off harness in favour of the new suite
+
 # 1.0.8
  - **Server** auto-detect LSP transport (IPC for VSCode, stdio for Neovim and other clients) so the same server binary works in both editors
  - **Server** parse the workspace on `initialized` when no `didChangeConfiguration` arrives, so go-to-definition works under clients that do not push configuration (e.g. Neovim)
