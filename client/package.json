@@ -2,7 +2,7 @@
     "name": "harbour-ankerdata",
     "displayName": "Harbour and xHarbour (Ankerdata)",
     "description": "Harbour and xHarbour languages support for visual studio code",
-    "version": "1.0.9",
+    "version": "1.0.10",
     "publisher": "ankerdata",
     "icon": "harbourIcon.png",
     "main": "./dist/extension",

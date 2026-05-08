@@ -1,6 +1,10 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.0.10
+ - **Server** fixed go-to-definition and hover landing in the `.c` files emitted by the Harbour→C compiler instead of the original `.prg` source; the workspace scan now detects generated artefacts via the `Generated C source from` header comment and `HB_INIT_SYMBOLS_BEGIN` / `HB_FUNC_INITSTATICS` / `HB_FUNC_INITLINES` macros and skips them. Hand-written companion `.c` files and `#pragma BEGINDUMP` blocks are still indexed, preserving go-to-definition for symbols that are only defined in C.
+ - **Tests** added unit tests and fixtures for the new `workspaceScan` predicate covering generated, hand-written, and edge-case inputs
+
 # 1.0.9
  - **Server** migrated to TypeScript with `strictNullChecks` for stronger compile-time safety; esbuild compiles `.ts` directly so the shipped bundle is byte-equivalent
  - **Server** fixed duplicate references and definitions when an LSP client sends a different URI form than the server synthesizes (surfaced on Windows + Neovim, where the client used `file:///C:/foo` while the server used `file:///c%3A/foo`); all URIs are now canonicalized at every entry point
