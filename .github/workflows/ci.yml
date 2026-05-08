@@ -30,6 +30,9 @@ jobs:
       - name: Type-check server
         run: npm --prefix server run typecheck
 
+      - name: Test server
+        run: npm --prefix server test
+
       - name: Build
         run: npm run build
 
