@@ -76,31 +76,82 @@ type AttachArgs = DebugProtocol.AttachRequestArguments & {
     process?: number;
 };
 
-export class harbourDebugSession extends debugadapter.DebugSession {
-    socket: net.Socket | null = null;
-    Debugging: boolean = true;
-    sourcePaths: string[] = [];
+/**
+ * Per-thread mutable state for the debug session.
+ *
+ * Today, every harbour program presents as a single thread (id 1) to VS Code;
+ * the session bootstraps with one ThreadState and routes all events through it.
+ * As issue #8 lands the multi-thread refactor, each Harbour thread will own
+ * its own ThreadState here (keyed by its harbour thread id) and DAP requests
+ * will look up the target thread by args.threadId.
+ */
+export class ThreadState {
+    id: number;
     processLine: ((line: string) => void) | undefined = undefined;
-    breakpoints: Record<string, BreakpointSource> = {};
     variables: HBVar[] = [];
     variablesMap: Map<string, number> = new Map();
     stack: DebugProtocol.StackTraceResponse[] = [];
     stackArgs: DebugProtocol.StackTraceArguments[] = [];
-    justStart: boolean = true;
-    queue: string = "";
     evaluateResponses: DebugProtocol.EvaluateResponse[] = [];
     scopeResponses: DebugProtocol.ScopesResponse[] = [];
     completionsResponse: DebugProtocol.CompletionsResponse | undefined = undefined;
     areasInfos: string[][] = [];
+    currentStack: number = 1;
+
+    constructor(id: number) {
+        this.id = id;
+    }
+}
+
+export const MAIN_THREAD_ID = 1;
+
+export class harbourDebugSession extends debugadapter.DebugSession {
+    socket: net.Socket | null = null;
+    Debugging: boolean = true;
+    sourcePaths: string[] = [];
+    breakpoints: Record<string, BreakpointSource> = {};
+    justStart: boolean = true;
+    queue: string = "";
     processId: number | undefined = undefined;
     pathCache: Map<string, string> = new Map();
     processInterval: NodeJS.Timeout | undefined = undefined;
-    currentStack: number = 1;
     startGo: boolean = false;
+
+    /** Live harbour threads, keyed by harbour thread id. Bootstraps with the main thread. */
+    threads: Map<number, ThreadState> = new Map([[MAIN_THREAD_ID, new ThreadState(MAIN_THREAD_ID)]]);
 
     constructor() {
         super();
     }
+
+    /** Currently every dispatcher operates on the main thread. Phase 2 will replace
+     *  these accessors with per-request lookups by args.threadId / variablesReference. */
+    get mainThread(): ThreadState {
+        return this.threads.get(MAIN_THREAD_ID)!;
+    }
+
+    // --- backwards-compat shims so the dispatcher code and existing tests can
+    //     keep using session.<field>; each accessor proxies to the main thread.
+    get processLine(): ((line: string) => void) | undefined { return this.mainThread.processLine; }
+    set processLine(v: ((line: string) => void) | undefined) { this.mainThread.processLine = v; }
+    get variables(): HBVar[] { return this.mainThread.variables; }
+    set variables(v: HBVar[]) { this.mainThread.variables = v; }
+    get variablesMap(): Map<string, number> { return this.mainThread.variablesMap; }
+    set variablesMap(v: Map<string, number>) { this.mainThread.variablesMap = v; }
+    get stack(): DebugProtocol.StackTraceResponse[] { return this.mainThread.stack; }
+    set stack(v: DebugProtocol.StackTraceResponse[]) { this.mainThread.stack = v; }
+    get stackArgs(): DebugProtocol.StackTraceArguments[] { return this.mainThread.stackArgs; }
+    set stackArgs(v: DebugProtocol.StackTraceArguments[]) { this.mainThread.stackArgs = v; }
+    get evaluateResponses(): DebugProtocol.EvaluateResponse[] { return this.mainThread.evaluateResponses; }
+    set evaluateResponses(v: DebugProtocol.EvaluateResponse[]) { this.mainThread.evaluateResponses = v; }
+    get scopeResponses(): DebugProtocol.ScopesResponse[] { return this.mainThread.scopeResponses; }
+    set scopeResponses(v: DebugProtocol.ScopesResponse[]) { this.mainThread.scopeResponses = v; }
+    get completionsResponse(): DebugProtocol.CompletionsResponse | undefined { return this.mainThread.completionsResponse; }
+    set completionsResponse(v: DebugProtocol.CompletionsResponse | undefined) { this.mainThread.completionsResponse = v; }
+    get areasInfos(): string[][] { return this.mainThread.areasInfos; }
+    set areasInfos(v: string[][]) { this.mainThread.areasInfos = v; }
+    get currentStack(): number { return this.mainThread.currentStack; }
+    set currentStack(v: number) { this.mainThread.currentStack = v; }
 
     processInput(buff: string): void {
         try {

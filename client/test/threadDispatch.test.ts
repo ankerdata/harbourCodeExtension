@@ -1,5 +1,5 @@
 import { DebugProtocol } from "@vscode/debugprotocol";
-import { harbourDebugSession } from "../src/debugger";
+import { harbourDebugSession, HBVar, ThreadState, MAIN_THREAD_ID } from "../src/debugger";
 
 type CapturedEvent = DebugProtocol.Event;
 type CapturedResponse = DebugProtocol.Response;
@@ -185,5 +185,33 @@ describe("debugger thread dispatch — single-thread baseline", () => {
         expect(stops).toHaveLength(2);
         expect(stops[0].body.threadId).toBe(1);
         expect(stops[1].body.threadId).toBe(1);
+    });
+});
+
+describe("ThreadState extraction (phase 1 refactor)", () => {
+    it("bootstraps with one ThreadState for the main thread", () => {
+        const { session } = makeSession();
+        expect(session.threads.size).toBe(1);
+        const main = session.threads.get(MAIN_THREAD_ID);
+        expect(main).toBeInstanceOf(ThreadState);
+        expect(main!.id).toBe(MAIN_THREAD_ID);
+        expect(main).toBe(session.mainThread);
+    });
+
+    it("shim accessors round-trip through the main ThreadState", () => {
+        const { session } = makeSession();
+        // Write via the shim, read via the underlying ThreadState
+        session.currentStack = 7;
+        expect(session.mainThread.currentStack).toBe(7);
+        // And vice versa
+        session.mainThread.variables.push(new HBVar("LOC:1:1:"));
+        expect(session.variables).toHaveLength(1);
+        // Mutating through the getter mutates the underlying array (shared reference)
+        session.variablesMap.set("X", 42);
+        expect(session.mainThread.variablesMap.get("X")).toBe(42);
+    });
+
+    it("MAIN_THREAD_ID is 1 to preserve the existing single-thread contract", () => {
+        expect(MAIN_THREAD_ID).toBe(1);
     });
 });
