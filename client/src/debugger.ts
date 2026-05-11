@@ -87,6 +87,10 @@ type AttachArgs = DebugProtocol.AttachRequestArguments & {
  */
 export class ThreadState {
     id: number;
+    name: string;
+    socket: net.Socket | null = null;
+    justStart: boolean = true;
+    queue: string = "";
     processLine: ((line: string) => void) | undefined = undefined;
     variables: HBVar[] = [];
     variablesMap: Map<string, number> = new Map();
@@ -98,20 +102,18 @@ export class ThreadState {
     areasInfos: string[][] = [];
     currentStack: number = 1;
 
-    constructor(id: number) {
+    constructor(id: number, name?: string) {
         this.id = id;
+        this.name = name ?? (id === MAIN_THREAD_ID ? "Main Thread" : `Thread ${id}`);
     }
 }
 
 export const MAIN_THREAD_ID = 1;
 
 export class harbourDebugSession extends debugadapter.DebugSession {
-    socket: net.Socket | null = null;
     Debugging: boolean = true;
     sourcePaths: string[] = [];
     breakpoints: Record<string, BreakpointSource> = {};
-    justStart: boolean = true;
-    queue: string = "";
     processId: number | undefined = undefined;
     pathCache: Map<string, string> = new Map();
     processInterval: NodeJS.Timeout | undefined = undefined;
@@ -132,6 +134,12 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
     // --- backwards-compat shims so the dispatcher code and existing tests can
     //     keep using session.<field>; each accessor proxies to the main thread.
+    get socket(): net.Socket | null { return this.mainThread.socket; }
+    set socket(v: net.Socket | null) { this.mainThread.socket = v; }
+    get justStart(): boolean { return this.mainThread.justStart; }
+    set justStart(v: boolean) { this.mainThread.justStart = v; }
+    get queue(): string { return this.mainThread.queue; }
+    set queue(v: string) { this.mainThread.queue = v; }
     get processLine(): ((line: string) => void) | undefined { return this.mainThread.processLine; }
     set processLine(v: ((line: string) => void) | undefined) { this.mainThread.processLine = v; }
     get variables(): HBVar[] { return this.mainThread.variables; }
@@ -569,9 +577,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     }
 
     protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
-        response.body = {
-            threads: [new debugadapter.Thread(1, "Main Thread")],
-        };
+        const threads: DebugProtocol.Thread[] = [];
+        for (const t of this.threads.values()) {
+            threads.push(new debugadapter.Thread(t.id, t.name));
+        }
+        response.body = { threads };
         this.sendResponse(response);
     }
 
