@@ -30,8 +30,14 @@ jobs:
       - name: Type-check server
         run: npm --prefix server run typecheck
 
+      - name: Type-check client
+        run: npm --prefix client run typecheck
+
       - name: Test server
         run: npm --prefix server test
+
+      - name: Test client
+        run: npm --prefix client test
 
       - name: Build
         run: npm run build

@@ -1,6 +1,11 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.0.11
+ - **Client** migrated to TypeScript with `strictNullChecks` for stronger compile-time safety; esbuild compiles `.ts` directly so the shipped bundle is byte-equivalent
+ - **Tests** added a Jest test suite under `client/test/` covering the debugger expression evaluator — `processExpression` line parsing, `getVariableFormat` for each Harbour type (`A`/`H`/`O`/scalars/`E`/`B`/`P`), and `evaluateName` construction including regression coverage for the colon-string and nested-array fixes shipped in 1.0.8
+ - **CI** client typecheck and tests now run on every push and PR across Linux and Windows
+
 # 1.0.10
  - **Server** fixed go-to-definition and hover landing in the `.c` files emitted by the Harbour→C compiler instead of the original `.prg` source; the workspace scan now detects generated artefacts via the `Generated C source from` header comment and `HB_INIT_SYMBOLS_BEGIN` / `HB_FUNC_INITSTATICS` / `HB_FUNC_INITLINES` macros and skips them. Hand-written companion `.c` files and `#pragma BEGINDUMP` blocks are still indexed, preserving go-to-definition for symbols that are only defined in C.
  - **Tests** added unit tests and fixtures for the new `workspaceScan` predicate covering generated, hand-written, and edge-case inputs

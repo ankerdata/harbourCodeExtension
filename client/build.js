@@ -8,8 +8,8 @@ function makeOptions(dev) {
   /** @type {import('esbuild').BuildOptions} */
   return {
     entryPoints: {
-      extension: path.join(__dirname, 'src', 'extension.js'),
-      debugger: path.join(__dirname, 'src', 'debugger.js'),
+      extension: path.join(__dirname, 'src', 'extension.ts'),
+      debugger: path.join(__dirname, 'src', 'debugger.ts'),
     },
     outdir: path.join(__dirname, 'dist'),
     bundle: true,
