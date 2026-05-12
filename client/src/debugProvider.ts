@@ -43,21 +43,26 @@ class HarbourDBGProvider implements vscode.DebugConfigurationProvider {
 
   resolveDebugConfiguration(
     _folder: vscode.WorkspaceFolder | undefined,
-    _debugConfiguration: vscode.DebugConfiguration,
+    debugConfiguration: vscode.DebugConfiguration,
     _token?: vscode.CancellationToken,
   ): vscode.ProviderResult<vscode.DebugConfiguration> {
-    return {
-      type: "harbour-dbg",
-      request: "launch",
-      name: "Launch currentFile",
-      preLaunchTask: localize("harbour.task.HBMK2.provideName3"),
-    };
+    if (!debugConfiguration || !debugConfiguration.type) {
+      return {
+        type: "harbour-dbg",
+        request: "launch",
+        name: "Launch currentFile",
+        preLaunchTask: localize("harbour.task.HBMK2.provideName3"),
+      };
+    }
+    return debugConfiguration;
   }
 }
 
-export function activate(): void {
-  vscode.debug.registerDebugConfigurationProvider(
-    "harbour-dbg",
-    new HarbourDBGProvider(),
+export function activate(context: vscode.ExtensionContext): void {
+  context.subscriptions.push(
+    vscode.debug.registerDebugConfigurationProvider(
+      "harbour-dbg",
+      new HarbourDBGProvider(),
+    ),
   );
 }

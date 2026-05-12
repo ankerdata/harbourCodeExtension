@@ -14,6 +14,23 @@ import * as decorator from "./decorator";
 import * as docCreator from "./docCreator";
 import * as taskProvider from "./taskProvider";
 import * as formatEditor from "./formatEditor";
+import * as debugProvider from "./debugProvider";
+
+// On some hosts (notably VS Code on win32-arm64) the default `runtime: node`
+// declared in the `debuggers` contribution silently fails to resolve `node`
+// from the spawn environment, so F5 produces no visible result. Returning
+// `process.execPath` (the Code.exe binary, which Electron runs in node mode
+// for this entrypoint) bypasses PATH lookup entirely. See bug #31.
+class HarbourDebugAdapterDescriptorFactory
+  implements vscode.DebugAdapterDescriptorFactory
+{
+  constructor(private readonly extensionPath: string) {}
+
+  createDebugAdapterDescriptor(): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
+    const program = path.join(this.extensionPath, "dist", "debugger.js");
+    return new vscode.DebugAdapterExecutable(process.execPath, [program]);
+  }
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   vscode.languages.setLanguageConfiguration("harbour", {
@@ -51,6 +68,15 @@ export function activate(context: vscode.ExtensionContext): void {
   cl.registerProposedFeatures();
   cl.start();
   context.subscriptions.push(cl);
+
+  debugProvider.activate(context);
+
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterDescriptorFactory(
+      "harbour-dbg",
+      new HarbourDebugAdapterDescriptorFactory(context.extensionPath),
+    ),
+  );
 
   vscode.commands.registerCommand("harbour.getDbgCode", () => {
     getDbgCode(context);

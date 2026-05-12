@@ -1,6 +1,9 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.1.1
+ - **Debugger** fixed F5 silently failing to launch the debug adapter on win32-arm64. VS Code's default resolution of the `runtime: node` declared in the `debuggers` contribution silently fails to find `node` in the debug-adapter spawn environment on that platform, producing no status-bar change, no spawn, and no error. The extension now registers an explicit `DebugAdapterDescriptorFactory` that returns `process.execPath` (Code.exe, which Electron runs in node mode for this entrypoint) so the adapter spawn no longer depends on PATH lookup. Also wires up `debugProvider.activate()` (the file was added in 1.0.11 but never activated), passes the user's launch config through `resolveDebugConfiguration` unchanged instead of overwriting it with a stub, and adds `onDebugResolve:harbour-dbg` as an activation event. Closes #31.
+
 # 1.1.0
  - **Debugger** multi-threaded debugging support — each Harbour thread of an MT program now appears as its own thread in VS Code's Call Stack panel with independent stop/continue/step control. `dbg_lib.prg` makes `__DEBUGITEM()` per-thread via `HB_TSD_NEW` (Harbour 3.2+; xHarbour and pre-3.2 fall back to the original single-thread global). The client accepts multiple Harbour socket connections, allocates a `ThreadState` per connection, and emits `ThreadEvent('started'/'exited')` on connect/disconnect. Control requests (`continue`/`next`/`stepIn`/`stepOut`/`pause`/`stackTrace`) route by `args.threadId`. Variable inspection (scopes/evaluate/variables) still routes to the main thread — see follow-up issue for per-thread variable routing.
  - **Tests** added integration coverage for two-thread handshake, per-thread stop events, ThreadEvent lifecycle, and pid-mismatch rejection

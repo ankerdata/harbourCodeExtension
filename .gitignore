@@ -40,3 +40,5 @@ trash
 appunti_formatter
 
 .claude
+
+*.code-workspace

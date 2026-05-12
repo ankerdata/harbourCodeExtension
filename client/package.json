@@ -2,7 +2,7 @@
   "name": "harbour-ankerdata",
   "displayName": "Harbour and xHarbour (Ankerdata)",
   "description": "Harbour and xHarbour languages support for visual studio code",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "ankerdata",
   "icon": "harbourIcon.png",
   "main": "./dist/extension",
@@ -13,7 +13,8 @@
     "onLanguage:harbour",
     "onCommand:harbour.getdbgcode",
     "onCommand:harbour.setupCodeFormat",
-    "workspaceContains:**/*.prg"
+    "workspaceContains:**/*.prg",
+    "onDebugResolve:harbour-dbg"
   ],
   "engines": {
     "vscode": "^1.40.0"
