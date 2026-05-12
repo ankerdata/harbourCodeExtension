@@ -108,6 +108,15 @@ export class ThreadState {
    * adding the cross-thread routing layer.
    */
   localToGlobalRef: Map<number, number> = new Map();
+  /**
+   * Set true while a non-main thread has just been auto-GO'd and might still
+   * race a stray "STOP:step" from dbg_lib's CheckSocket sleep+STOP:step branch
+   * (initial state, lStopSent=.F., lRunning=.F. until our GO is processed).
+   * processInput swallows that one racing event and clears the flag on the
+   * first message received from this thread, so legitimate post-step STOP:step
+   * events later are forwarded normally. See #34.
+   */
+  pendingAutoGo: boolean = false;
   stack: DebugProtocol.StackTraceResponse[] = [];
   stackArgs: DebugProtocol.StackTraceArguments[] = [];
   evaluateResponses: DebugProtocol.EvaluateResponse[] = [];
@@ -271,10 +280,31 @@ export class harbourDebugSession extends debugadapter.DebugSession {
             this.processLine(line);
             continue;
           }
+          // Auto-GO race window: a freshly-connected non-main thread may have
+          // entered dbg_lib's sleep+STOP:step branch before our auto-GO arrived
+          // (the runtime sends the spurious "STOP:step" after a 100ms sleep
+          // when lStopSent=.F. and lRunning=.F.). Swallow that one racing
+          // event, then clear the flag so subsequent legit STOP:step events
+          // (after a real stepInRequest) are processed normally. The flag is
+          // cleared on the first non-empty line either way.
+          if (thread.pendingAutoGo) {
+            thread.pendingAutoGo = false;
+            if (line === "STOP:step") continue;
+          }
           if (line.startsWith("STOP")) {
-            this.sendEvent(
-              new debugadapter.StoppedEvent(line.substring(5), thread.id),
+            const stopEvt = new debugadapter.StoppedEvent(
+              line.substring(5),
+              thread.id,
             );
+            // The DAP spec leaves the meaning of an omitted allThreadsStopped
+            // up to the client; VS Code in practice falls into all-stop UI
+            // semantics (other threads marked paused, focus ricocheting on the
+            // next stop). Per-thread stop is what the runtime actually does
+            // (each thread has its own dbg_lib state since 1.1.0), so be
+            // explicit. See #34.
+            (stopEvt.body as DebugProtocol.StoppedEvent["body"]).allThreadsStopped =
+              false;
+            this.sendEvent(stopEvt);
             this.sendEvent({
               event: "invalidated",
               body: { areas: ["variables", "stacks"], threadId: thread.id },
@@ -297,6 +327,9 @@ export class harbourDebugSession extends debugadapter.DebugSession {
               thread.id,
               line.substring(6),
             );
+            // See STOP branch above.
+            (stopEvt.body as DebugProtocol.StoppedEvent["body"]).allThreadsStopped =
+              false;
             this.sendEvent(stopEvt);
             continue;
           }
@@ -722,6 +755,18 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     }
     thread.justStart = false;
     thread.queue = "";
+
+    // Auto-GO non-main threads. dbg_lib initialises lRunning=.F. for every
+    // new thread and surfaces a STOP:step after a 100ms sleep when no command
+    // arrives — without this every spawned worker would appear paused on its
+    // first line in VS Code and the user would have to click Continue on each.
+    // Main is excluded because configurationDoneRequest already drives main's
+    // GO (gated on stopOnEntry); duplicating it here would either double-start
+    // or override the user's stopOnEntry choice.
+    if (!isFirst) {
+      thread.pendingAutoGo = true;
+      tc.commandTo(thread, "GO\r\n");
+    }
   }
 
   /** Look up the ThreadState for a DAP-supplied threadId; fall back to the main
@@ -1260,6 +1305,12 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   ): void {
     const thread = this.selectThread(args.threadId);
     this.commandTo(thread, "GO\r\n");
+    // DAP spec: an omitted allThreadsContinued is treated as true. We only
+    // sent GO to one thread's socket, so leaving it unset would mislead VS
+    // Code into marking other threads as running and re-snapshotting them on
+    // the next stop. The runtime models threads independently, so per-thread
+    // continue is the truthful answer. See #34.
+    response.body = { ...(response.body ?? {}), allThreadsContinued: false };
     this.sendResponse(response);
   }
   protected nextRequest(

@@ -1,7 +1,7 @@
 {
   "name": "harbour-lang-server-ankerdata",
   "description": "Server part of Harbour language support for visual studio code.",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "author": "ankerdata",
   "main": "dist/hb_server.js",
   "bin": {
