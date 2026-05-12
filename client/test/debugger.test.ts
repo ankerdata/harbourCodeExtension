@@ -27,7 +27,12 @@ function makeSession(): {
   ).sendResponse = (r) => {
     responses.push(r);
   };
-  session.command = (cmd: string) => {
+  // Capture every wire-side write at commandTo, the single funnel that both
+  // legacy `this.command(...)` (which delegates to commandTo) and the new
+  // explicit `commandTo(thread, ...)` calls flow through. Stubbing only
+  // `command` would miss the per-thread routed dispatch the variable-inspection
+  // path now uses.
+  session.commandTo = (_thread, cmd: string) => {
     commands.push(cmd);
   };
   return { session, events, responses, commands };

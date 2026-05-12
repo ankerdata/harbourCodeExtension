@@ -50,6 +50,10 @@ function makeSession(): {
   ).sendResponse = (r) => {
     responses.push(r);
   };
+  // NOTE: don't stub commandTo here — most tests in this file go through
+  // acceptThreadSocket so commandTo writes to real FakeSockets, and the
+  // assertions read socket.written directly. Stubbing the legacy `command`
+  // shim is harmless since no test in this file consumes the captured array.
   session.command = (cmd: string) => {
     commands.push(cmd);
   };
@@ -669,5 +673,352 @@ describe("ThreadState extraction (phase 1 refactor)", () => {
 
   it("MAIN_THREAD_ID is 1 to preserve the existing single-thread contract", () => {
     expect(MAIN_THREAD_ID).toBe(1);
+  });
+});
+
+/**
+ * Phase 4 (issue #29): variable inspection routing.
+ *
+ * scopesRequest, evaluateRequest, and variablesRequest don't carry threadId —
+ * they identify their target via opaque ids the adapter previously returned
+ * (frameId, variablesReference). To make these per-thread-aware, sendStack /
+ * sendScope / getVarReference now allocate global ids on the session and store
+ * the owning thread, so the inbound handlers can resolve back to the right
+ * ThreadState.
+ *
+ * These tests pin that round-trip end-to-end: drive a STACK / INERROR through
+ * a non-main thread's socket, then assert that follow-up DAP requests with the
+ * resulting ids dispatch onto that thread's socket and update its state — and
+ * never bleed onto the main thread.
+ */
+describe("Phase 4: per-thread variable inspection routing", () => {
+  function attachTwoThreads(): {
+    session: harbourDebugSession;
+    events: CapturedEvent[];
+    main: { thread: ThreadState; socket: FakeSocket };
+    secondary: { thread: ThreadState; socket: FakeSocket };
+  } {
+    const { session, events } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+
+    const firstSocket = new FakeSocket();
+    accept(firstSocket, fakeServer);
+    const mainThread = session.mainThread;
+
+    const secondSocket = new FakeSocket();
+    accept(secondSocket, fakeServer);
+    const startedEvents = events.filter(
+      (e) => e.event === "thread",
+    ) as DebugProtocol.ThreadEvent[];
+    const secId = startedEvents[0].body.threadId;
+    const secondary = session.threads.get(secId)!;
+
+    return {
+      session,
+      events,
+      main: { thread: mainThread, socket: firstSocket },
+      secondary: { thread: secondary, socket: secondSocket },
+    };
+  }
+
+  function freshScopeResponse(): DebugProtocol.ScopesResponse {
+    return {
+      type: "response",
+      request_seq: 1,
+      success: true,
+      command: "scopes",
+      seq: 0,
+      body: { scopes: [] },
+    };
+  }
+
+  function freshVariablesResponse(): DebugProtocol.VariablesResponse {
+    return {
+      type: "response",
+      request_seq: 1,
+      success: true,
+      command: "variables",
+      seq: 0,
+      body: { variables: [] },
+    };
+  }
+
+  function freshEvaluateResponse(): DebugProtocol.EvaluateResponse {
+    return {
+      type: "response",
+      request_seq: 1,
+      success: true,
+      command: "evaluate",
+      seq: 0,
+      body: { result: "", variablesReference: 0 },
+    };
+  }
+
+  it("sendStack on a non-main thread allocates frame ids that resolve back to that thread", () => {
+    const { session, secondary } = attachTwoThreads();
+
+    // STACK 2 + two frame data lines on secondary's socket.
+    secondary.socket.emit(
+      "data",
+      Buffer.from("STACK 2\r\nfoo.prg:10:bar:\r\nbaz.prg:42:qux:\r\n"),
+    );
+
+    // Two global frame ids should now be allocated, both bound to secondary.
+    const owned = [...session.frameIds.entries()].filter(
+      ([, info]) => info.thread === secondary.thread,
+    );
+    expect(owned).toHaveLength(2);
+    // Local indices 0 and 1, in emission order.
+    expect(owned.map(([, info]) => info.localFrameIdx).sort()).toEqual([0, 1]);
+    // No frame id should be bound to main.
+    const ownedByMain = [...session.frameIds.values()].filter(
+      (info) => info.thread === session.mainThread,
+    );
+    expect(ownedByMain).toHaveLength(0);
+  });
+
+  it("scopesRequest with a frameId allocated on the secondary thread routes INERROR to that thread only", () => {
+    const { session, main, secondary } = attachTwoThreads();
+    secondary.socket.emit(
+      "data",
+      Buffer.from("STACK 1\r\nfoo.prg:10:bar:\r\n"),
+    );
+    const [frameId, info] = [...session.frameIds.entries()][0];
+    expect(info.thread).toBe(secondary.thread);
+
+    main.socket.written.length = 0;
+    secondary.socket.written.length = 0;
+
+    (
+      session as unknown as {
+        scopesRequest: (
+          r: DebugProtocol.ScopesResponse,
+          a: DebugProtocol.ScopesArguments,
+        ) => void;
+      }
+    ).scopesRequest(freshScopeResponse(), { frameId });
+
+    expect(secondary.socket.written).toContain("INERROR\r\n");
+    expect(main.socket.written).not.toContain("INERROR\r\n");
+    expect(secondary.thread.currentStack).toBe(info.localFrameIdx + 1);
+    expect(secondary.thread.scopeResponses).toHaveLength(1);
+    expect(main.thread.scopeResponses).toHaveLength(0);
+  });
+
+  it("evaluateRequest with a frameId allocated on the secondary thread routes EXPRESSION to that thread only", () => {
+    const { session, main, secondary } = attachTwoThreads();
+    secondary.socket.emit(
+      "data",
+      Buffer.from("STACK 1\r\nfoo.prg:10:bar:\r\n"),
+    );
+    const [frameId, info] = [...session.frameIds.entries()][0];
+
+    main.socket.written.length = 0;
+    secondary.socket.written.length = 0;
+
+    (
+      session as unknown as {
+        evaluateRequest: (
+          r: DebugProtocol.EvaluateResponse,
+          a: DebugProtocol.EvaluateArguments,
+        ) => void;
+      }
+    ).evaluateRequest(freshEvaluateResponse(), {
+      expression: "myLocal",
+      frameId,
+    });
+
+    // EXPRESSION uses 1-based frame index and lands on secondary's socket.
+    expect(secondary.socket.written).toContain(
+      `EXPRESSION\r\n${info.localFrameIdx + 1}:myLocal\r\n`,
+    );
+    expect(
+      main.socket.written.some((s: string) => s.startsWith("EXPRESSION\r\n")),
+    ).toBe(false);
+    // Response queued on secondary, so processExpression on the secondary's
+    // wire data dequeues the right one.
+    expect(secondary.thread.evaluateResponses).toHaveLength(1);
+    expect(main.thread.evaluateResponses).toHaveLength(0);
+  });
+
+  it("variablesRequest with a varRef allocated by sendScope on the secondary thread routes the wire command back to that thread", () => {
+    const { session, main, secondary } = attachTwoThreads();
+    // Pre-queue the scope response on secondary; sendScope will dequeue from
+    // secondary.scopeResponses (currentThread inside processInput).
+    secondary.thread.scopeResponses.push(freshScopeResponse());
+
+    // INERROR F → sendScope(false) on secondary, allocating 6 var refs against it.
+    secondary.socket.emit("data", Buffer.from("INERROR F\r\n"));
+
+    // Six refs should now be bound to secondary, none to main.
+    const refsForSecondary = [...session.varRefs.entries()].filter(
+      ([, v]) => v.thread === secondary.thread,
+    );
+    expect(refsForSecondary).toHaveLength(6);
+    expect(
+      [...session.varRefs.values()].some((v) => v.thread === main.thread),
+    ).toBe(false);
+
+    // Locate the LOCALS scope's global ref via secondary's per-thread maps.
+    const localsLocalIdx = secondary.thread.variablesMap.get("LOCALS")!;
+    const localsGlobalRef =
+      secondary.thread.localToGlobalRef.get(localsLocalIdx)!;
+    expect(localsGlobalRef).toBeGreaterThan(0);
+
+    main.socket.written.length = 0;
+    secondary.socket.written.length = 0;
+
+    (
+      session as unknown as {
+        variablesRequest: (
+          r: DebugProtocol.VariablesResponse,
+          a: DebugProtocol.VariablesArguments,
+        ) => void;
+      }
+    ).variablesRequest(freshVariablesResponse(), {
+      variablesReference: localsGlobalRef,
+    });
+
+    // The LOCALS expansion command lands on secondary's socket, never on main.
+    expect(
+      secondary.socket.written.some((s: string) => s.startsWith("LOCALS\r\n")),
+    ).toBe(true);
+    expect(
+      main.socket.written.some((s: string) => s.startsWith("LOCALS\r\n")),
+    ).toBe(false);
+    // The response is queued on the right HBVar so sendVariables (driven by
+    // secondary's wire data) dequeues it.
+    expect(secondary.thread.variables[localsLocalIdx].responses).toHaveLength(
+      1,
+    );
+  });
+
+  it("ensureGlobalRef dedupes per (thread, localIdx) so repeated sendScope/getVarReference returns one stable id", () => {
+    const { session, secondary } = attachTwoThreads();
+    secondary.thread.variables.push(new HBVar("LOC:1:1:"));
+
+    const a = session.ensureGlobalRef(secondary.thread, 0);
+    const b = session.ensureGlobalRef(secondary.thread, 0);
+    expect(a).toBe(b);
+
+    // Same local index on a different thread is a different global ref.
+    session.mainThread.variables.push(new HBVar("LOC:1:1:"));
+    const mainRef = session.ensureGlobalRef(session.mainThread, 0);
+    expect(mainRef).not.toBe(a);
+  });
+
+  it("variablesRequest with an unknown variablesReference returns an empty response without crashing", () => {
+    const { session, responses } = makeSession();
+
+    (
+      session as unknown as {
+        variablesRequest: (
+          r: DebugProtocol.VariablesResponse,
+          a: DebugProtocol.VariablesArguments,
+        ) => void;
+      }
+    ).variablesRequest(freshVariablesResponse(), { variablesReference: 99999 });
+
+    expect(responses).toHaveLength(1);
+  });
+
+  it("stackTraceRequest on one thread clears that thread's prior var refs from the global registry without dropping another thread's", () => {
+    const { session, main, secondary } = attachTwoThreads();
+
+    // Allocate refs on both threads via the public allocator path.
+    main.thread.variables.push(new HBVar("LOC:1:1:"), new HBVar("LOC:1:2:"));
+    main.thread.variablesMap.set("LOC:1:1:", 0);
+    main.thread.variablesMap.set("LOC:1:2:", 1);
+    const refMainA = session.ensureGlobalRef(main.thread, 0);
+    const refMainB = session.ensureGlobalRef(main.thread, 1);
+
+    secondary.thread.variables.push(new HBVar("LOC:1:1:"));
+    secondary.thread.variablesMap.set("LOC:1:1:", 0);
+    const refSec = session.ensureGlobalRef(secondary.thread, 0);
+
+    expect(session.varRefs.has(refMainA)).toBe(true);
+    expect(session.varRefs.has(refMainB)).toBe(true);
+    expect(session.varRefs.has(refSec)).toBe(true);
+
+    // stackTraceRequest on secondary clears its slate — main's refs survive.
+    (
+      session as unknown as {
+        stackTraceRequest: (
+          r: DebugProtocol.StackTraceResponse,
+          a: DebugProtocol.StackTraceArguments,
+        ) => void;
+      }
+    ).stackTraceRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "stackTrace",
+        seq: 0,
+        body: { stackFrames: [] },
+      },
+      { threadId: secondary.thread.id },
+    );
+
+    expect(session.varRefs.has(refMainA)).toBe(true);
+    expect(session.varRefs.has(refMainB)).toBe(true);
+    expect(session.varRefs.has(refSec)).toBe(false);
+    expect(secondary.thread.variables).toHaveLength(0);
+    expect(secondary.thread.variablesMap.size).toBe(0);
+    expect(secondary.thread.localToGlobalRef.size).toBe(0);
+  });
+
+  it("sendStack clears prior frame ids for the same thread but leaves other threads' ids intact", () => {
+    const { session, main, secondary } = attachTwoThreads();
+
+    // First STACK on each thread.
+    main.socket.emit("data", Buffer.from("STACK 1\r\nfoo.prg:1:a:\r\n"));
+    secondary.socket.emit("data", Buffer.from("STACK 1\r\nbar.prg:2:b:\r\n"));
+    expect(session.frameIds.size).toBe(2);
+
+    const mainFrameIdBefore = [...session.frameIds.entries()].find(
+      ([, info]) => info.thread === main.thread,
+    )![0];
+    const secFrameIdBefore = [...session.frameIds.entries()].find(
+      ([, info]) => info.thread === secondary.thread,
+    )![0];
+
+    // Second STACK on secondary — its old frame id is reaped, main's survives.
+    secondary.socket.emit("data", Buffer.from("STACK 1\r\nbar.prg:3:b:\r\n"));
+
+    expect(session.frameIds.has(mainFrameIdBefore)).toBe(true);
+    expect(session.frameIds.has(secFrameIdBefore)).toBe(false);
+    // Exactly one frame id for secondary now (the new one).
+    expect(
+      [...session.frameIds.values()].filter(
+        (info) => info.thread === secondary.thread,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("scopesRequest with a frameId never seen by sendStack falls back to the main thread (single-thread compat)", () => {
+    // Pre-MT clients (and the existing evaluateRequest test that passes a raw
+    // frameId of 2) expect frameId to be treated as a 0-based local frame
+    // index on the main thread. resolveFrame's fallback preserves that.
+    const { session, main } = attachTwoThreads();
+    main.socket.written.length = 0;
+
+    (
+      session as unknown as {
+        scopesRequest: (
+          r: DebugProtocol.ScopesResponse,
+          a: DebugProtocol.ScopesArguments,
+        ) => void;
+      }
+    ).scopesRequest(freshScopeResponse(), { frameId: 4 });
+
+    expect(main.socket.written).toContain("INERROR\r\n");
+    expect(main.thread.currentStack).toBe(5); // 4 + 1
+    expect(main.thread.scopeResponses).toHaveLength(1);
   });
 });

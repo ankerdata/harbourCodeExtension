@@ -99,6 +99,15 @@ export class ThreadState {
   processLine: ((line: string) => void) | undefined = undefined;
   variables: HBVar[] = [];
   variablesMap: Map<string, number> = new Map();
+  /**
+   * For each local index in `variables[]`, the global var ref handed out to VS
+   * Code. The session keeps the inverse map (globalRef -> {thread, localIdx})
+   * in `varRefs`; this side-map exists so that repeated `getVarReference` /
+   * `sendScope` calls for the same local index dedupe to one global ref —
+   * preserving the existing in-stop dedup semantics of `variablesMap` while
+   * adding the cross-thread routing layer.
+   */
+  localToGlobalRef: Map<number, number> = new Map();
   stack: DebugProtocol.StackTraceResponse[] = [];
   stackArgs: DebugProtocol.StackTraceArguments[] = [];
   evaluateResponses: DebugProtocol.EvaluateResponse[] = [];
@@ -133,6 +142,22 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
   /** Allocator for non-main thread ids (assigned as new harbour threads connect). */
   private nextThreadId: number = MAIN_THREAD_ID + 1;
+
+  /**
+   * Global frameId / variablesReference registries. These IDs are the opaque
+   * handles VS Code echoes back in `scopesRequest(args.frameId)`,
+   * `evaluateRequest(args.frameId)`, and `variablesRequest(args.variablesReference)` —
+   * none of which carry `args.threadId`. To route the request to the originating
+   * thread we encode the owner here when handing out the ID, then look it up on
+   * the way back. Kept simple (Map + monotonically-increasing counter) rather
+   * than bit-packed because the maps are cleared per-thread on every new STACK,
+   * so they don't grow without bound.
+   */
+  frameIds: Map<number, { thread: ThreadState; localFrameIdx: number }> =
+    new Map();
+  varRefs: Map<number, { thread: ThreadState; localIdx: number }> = new Map();
+  private nextFrameId: number = 1;
+  private nextVarRef: number = 1;
 
   /**
    * Active thread for the in-flight socket dispatch. processInput(buff, thread) sets
@@ -709,6 +734,54 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     return this.mainThread;
   }
 
+  /** Mint a new global frame ID for a frame that belongs to `thread`. */
+  allocateFrameId(thread: ThreadState, localFrameIdx: number): number {
+    const id = this.nextFrameId++;
+    this.frameIds.set(id, { thread, localFrameIdx });
+    return id;
+  }
+
+  /**
+   * Return the global var ref for `(thread, localIdx)`, allocating once and
+   * memoising on the thread so that callers within a single STOP that hit the
+   * same local index (the dedup path through `variablesMap`) get back the same
+   * global ref VS Code already saw.
+   */
+  ensureGlobalRef(thread: ThreadState, localIdx: number): number {
+    const existing = thread.localToGlobalRef.get(localIdx);
+    if (existing !== undefined) return existing;
+    const id = this.nextVarRef++;
+    this.varRefs.set(id, { thread, localIdx });
+    thread.localToGlobalRef.set(localIdx, id);
+    return id;
+  }
+
+  /**
+   * Drop a thread's frame IDs from the session registry. Called from sendStack
+   * before allocating a new batch — without this the registry would grow
+   * unboundedly across stops, and stale IDs could collide with VS Code's
+   * post-invalidation re-requests.
+   */
+  clearThreadFrameIds(thread: ThreadState): void {
+    for (const [id, info] of this.frameIds) {
+      if (info.thread === thread) this.frameIds.delete(id);
+    }
+  }
+
+  /**
+   * Drop a thread's variables registrations + the corresponding global refs.
+   * Called from stackTraceRequest when the runtime's stack is being refetched,
+   * mirroring the existing per-thread `variables`/`variablesMap` reset.
+   */
+  clearThreadVars(thread: ThreadState): void {
+    for (const globalRef of thread.localToGlobalRef.values()) {
+      this.varRefs.delete(globalRef);
+    }
+    thread.variables = [];
+    thread.variablesMap.clear();
+    thread.localToGlobalRef.clear();
+  }
+
   command(cmd: string): void {
     this.commandTo(this.currentThread, cmd);
   }
@@ -737,8 +810,7 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   ): void {
     const thread = this.selectThread(args.threadId);
     if (thread.stack.length === 0) {
-      thread.variables = [];
-      thread.variablesMap.clear();
+      this.clearThreadVars(thread);
       this.commandTo(thread, "STACK\r\n");
     }
     thread.stack.push(response);
@@ -755,6 +827,13 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   }
 
   sendStack(line: string): void {
+    // Capture the thread that requested the stack now — by the time the
+    // line-by-line frame data arrives, processInput will still set
+    // currentThread to this same thread (frame data flows on the same socket),
+    // but binding `thread` here makes the frameId-allocation below explicit
+    // and survives any future change to where processLine fires from.
+    const thread = this.currentThread;
+    this.clearThreadFrameIds(thread);
     const nStack = parseInt(line.substring(6));
     const frames: DebugProtocol.StackFrame[] = new Array(nStack);
     let j = 0;
@@ -808,8 +887,9 @@ export class harbourDebugSession extends debugadapter.DebugSession {
         }
 
         if (found && completePath) infos[0] = path.basename(completePath);
+        const frameId = tc.allocateFrameId(thread, j);
         frames[j] = new debugadapter.StackFrame(
-          j,
+          frameId,
           infos[2],
           new debugadapter.Source(infos[0], completePath),
           parseInt(infos[1]),
@@ -842,16 +922,35 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   }
 
   /// VARIABLES
+  /**
+   * Resolve a DAP frameId back to its owning thread + 0-based local frame
+   * index. Falls back to (mainThread, frameId) when the id wasn't allocated by
+   * us — that path covers single-thread programs that pre-date the registry as
+   * well as synthetic test inputs that pass raw frame indices.
+   */
+  private resolveFrame(frameId: number): {
+    thread: ThreadState;
+    localFrameIdx: number;
+  } {
+    const info = this.frameIds.get(frameId);
+    if (info) return info;
+    return { thread: this.mainThread, localFrameIdx: frameId };
+  }
+
   protected scopesRequest(
     response: DebugProtocol.ScopesResponse,
     args: DebugProtocol.ScopesArguments,
   ): void {
-    this.currentStack = args.frameId + 1;
-    this.scopeResponses.push(response);
-    this.command("INERROR\r\n");
+    const { thread, localFrameIdx } = this.resolveFrame(args.frameId);
+    thread.currentStack = localFrameIdx + 1;
+    thread.scopeResponses.push(response);
+    this.commandTo(thread, "INERROR\r\n");
   }
 
   sendScope(inError: boolean): void {
+    // sendScope runs from processInput's INERROR handler, so currentThread is
+    // already the thread that emitted the response — bind it locally for clarity.
+    const thread = this.currentThread;
     const commands: string[] = [];
     if (inError) commands.push("ERROR_VAR");
     commands.push(
@@ -863,27 +962,34 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       "WORKAREAS",
     );
 
-    let n = this.variablesMap.get(commands[0]);
-    if (n === undefined) {
-      n = this.variables.length;
+    if (thread.variablesMap.get(commands[0]) === undefined) {
       commands.forEach((cmd) => {
-        const hbVar = new HBVar(cmd);
-        const index = this.variables.length;
-        this.variables.push(hbVar);
-        this.variablesMap.set(cmd, index);
+        const index = thread.variables.length;
+        thread.variables.push(new HBVar(cmd));
+        thread.variablesMap.set(cmd, index);
       });
     }
-    const scopes: debugadapter.Scope[] = [];
-    if (inError) scopes.push(new debugadapter.Scope("Error", ++n));
-    scopes.push(
-      new debugadapter.Scope("Local", ++n),
-      new debugadapter.Scope("Public", ++n),
-      new debugadapter.Scope("Private local", ++n),
-      new debugadapter.Scope("Private external", ++n),
-      new debugadapter.Scope("Statics", ++n),
-      new debugadapter.Scope("Workareas", ++n),
+    const scopeLabels: string[] = [];
+    if (inError) scopeLabels.push("Error");
+    scopeLabels.push(
+      "Local",
+      "Public",
+      "Private local",
+      "Private external",
+      "Statics",
+      "Workareas",
     );
-    const response = this.scopeResponses.shift();
+    const scopes: debugadapter.Scope[] = [];
+    for (let i = 0; i < commands.length; i++) {
+      const localIdx = thread.variablesMap.get(commands[i])!;
+      scopes.push(
+        new debugadapter.Scope(
+          scopeLabels[i],
+          this.ensureGlobalRef(thread, localIdx),
+        ),
+      );
+    }
+    const response = thread.scopeResponses.shift();
     if (!response) {
       this.sendEvent(
         new debugadapter.OutputEvent(
@@ -945,22 +1051,60 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     response: DebugProtocol.VariablesResponse,
     args: DebugProtocol.VariablesArguments,
   ): void {
-    if (args.variablesReference <= this.variables.length) {
-      const hbStart = args.start ? args.start + 1 : 1;
-      const hbCount = args.count ? args.count : 0;
-      const cmd = this.variables[args.variablesReference - 1].command;
-      if (cmd.startsWith("AREA") && cmd.indexOf(":") < 0) {
-        this.sendAreaHeaders(response, cmd);
-        return;
-      }
-      this.variables[args.variablesReference - 1].responses.push(response);
-      this.command(`${cmd}\r\n${this.currentStack}:${hbStart}:${hbCount}\r\n`);
-    } else this.sendResponse(response);
+    const ref = this.varRefs.get(args.variablesReference);
+    if (!ref) {
+      this.sendResponse(response);
+      return;
+    }
+    const { thread, localIdx } = ref;
+    if (localIdx >= thread.variables.length) {
+      this.sendResponse(response);
+      return;
+    }
+    const hbVar = thread.variables[localIdx];
+    const cmd = hbVar.command;
+    if (cmd.startsWith("AREA") && cmd.indexOf(":") < 0) {
+      // sendAreaHeaders dispatches `getVarReference` for the FIELDS sub-ref,
+      // which keys off currentThread; pivot the dispatch context to the owning
+      // thread so the FIELDS ref is allocated against it (and not against
+      // whichever thread happens to be currentThread today, which is mainThread
+      // when called from a DAP request).
+      this.withCurrentThread(thread, () =>
+        this.sendAreaHeaders(response, cmd),
+      );
+      return;
+    }
+    const hbStart = args.start ? args.start + 1 : 1;
+    const hbCount = args.count ? args.count : 0;
+    hbVar.responses.push(response);
+    this.commandTo(
+      thread,
+      `${cmd}\r\n${thread.currentStack}:${hbStart}:${hbCount}\r\n`,
+    );
+  }
+
+  /**
+   * Run `fn` with `currentThread` pivoted to `thread`. Mirrors the save/restore
+   * pattern in processInput so DAP request handlers can borrow a thread's
+   * dispatch context for the duration of a synchronous helper that still uses
+   * the shim accessors (e.g. sendAreaHeaders -> getVarReference).
+   */
+  private withCurrentThread<T>(thread: ThreadState, fn: () => T): T {
+    const prev = this.currentThread;
+    this.currentThread = thread;
+    try {
+      return fn();
+    } finally {
+      this.currentThread = prev;
+    }
   }
 
   getVarReference(line: string, evalTxt: string): number {
-    const existingIndex = this.variablesMap.get(line);
-    if (existingIndex !== undefined) return existingIndex + 1;
+    const thread = this.currentThread;
+    const existingIndex = thread.variablesMap.get(line);
+    if (existingIndex !== undefined) {
+      return this.ensureGlobalRef(thread, existingIndex);
+    }
 
     const colonCount = (line.match(/:/g) || []).length;
     if (colonCount > 3) {
@@ -970,9 +1114,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     }
     const hbVar = new HBVar(line);
     hbVar.evaluation = evalTxt;
-    this.variables.push(hbVar);
-    this.variablesMap.set(line, this.variables.length - 1);
-    return this.variables.length;
+    const localIdx = thread.variables.length;
+    thread.variables.push(hbVar);
+    thread.variablesMap.set(line, localIdx);
+    return this.ensureGlobalRef(thread, localIdx);
   }
 
   getVariableFormat(
@@ -1296,13 +1441,24 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     response: DebugProtocol.EvaluateResponse,
     args: DebugProtocol.EvaluateArguments,
   ): void {
+    // When the caller supplies frameId we look up its owning thread; otherwise
+    // (Watch panel without an active stack frame) fall back to the main thread
+    // and its currentStack — preserving pre-MT behaviour.
+    let thread: ThreadState;
+    let frameNumber: number;
+    if (Number.isInteger(args.frameId)) {
+      const resolved = this.resolveFrame(args.frameId as number);
+      thread = resolved.thread;
+      frameNumber = resolved.localFrameIdx + 1;
+    } else {
+      thread = this.mainThread;
+      frameNumber = thread.currentStack;
+    }
     response.body = { result: args.expression, variablesReference: 0 };
-    this.evaluateResponses.push(response);
-    const frameId = Number.isInteger(args.frameId)
-      ? (args.frameId as number) + 1
-      : this.currentStack;
-    this.command(
-      `EXPRESSION\r\n${frameId}:${args.expression.replace(/:/g, ";")}\r\n`,
+    thread.evaluateResponses.push(response);
+    this.commandTo(
+      thread,
+      `EXPRESSION\r\n${frameNumber}:${args.expression.replace(/:/g, ";")}\r\n`,
     );
   }
 
@@ -1357,15 +1513,26 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     response: DebugProtocol.CompletionsResponse,
     args: DebugProtocol.CompletionsArguments,
   ): void {
-    this.completionsResponse = response;
+    let thread: ThreadState;
+    let frameNumber: number;
+    if (args.frameId !== undefined) {
+      const resolved = this.resolveFrame(args.frameId);
+      thread = resolved.thread;
+      frameNumber = resolved.localFrameIdx + 1;
+    } else {
+      thread = this.mainThread;
+      frameNumber = thread.currentStack;
+    }
+    thread.completionsResponse = response;
     const linesArr = args.text.split(/[\r\n]{1,2}/);
     let completionText = args.line ? linesArr[args.line - 1] : linesArr[0];
     completionText = completionText.substring(0, args.column - 1);
     const lastWord = completionText.match(/[\w\:]+$/i);
     if (lastWord) completionText = lastWord[0];
-    const frameId =
-      (args.frameId !== undefined ? args.frameId + 1 : 0) || this.currentStack;
-    this.command(`COMPLETION\r\n${frameId}:${completionText}\r\n`);
+    this.commandTo(
+      thread,
+      `COMPLETION\r\n${frameNumber}:${completionText}\r\n`,
+    );
   }
 
   processCompletion(): void {
