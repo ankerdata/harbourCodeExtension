@@ -1,6 +1,11 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.1.0
+ - **Debugger** multi-threaded debugging support — each Harbour thread of an MT program now appears as its own thread in VS Code's Call Stack panel with independent stop/continue/step control. `dbg_lib.prg` makes `__DEBUGITEM()` per-thread via `HB_TSD_NEW` (Harbour 3.2+; xHarbour and pre-3.2 fall back to the original single-thread global). The client accepts multiple Harbour socket connections, allocates a `ThreadState` per connection, and emits `ThreadEvent('started'/'exited')` on connect/disconnect. Control requests (`continue`/`next`/`stepIn`/`stepOut`/`pause`/`stackTrace`) route by `args.threadId`. Variable inspection (scopes/evaluate/variables) still routes to the main thread — see follow-up issue for per-thread variable routing.
+ - **Tests** added integration coverage for two-thread handshake, per-thread stop events, ThreadEvent lifecycle, and pid-mismatch rejection
+ - **Internal** `harbourDebugSession` mutable state extracted into a per-thread `ThreadState` class with `Map<number, ThreadState>` keyed by harbour thread id
+
 # 1.0.11
  - **Client** migrated to TypeScript with `strictNullChecks` for stronger compile-time safety; esbuild compiles `.ts` directly so the shipped bundle is byte-equivalent
  - **Tests** added a Jest test suite under `client/test/` covering the debugger expression evaluator — `processExpression` line parsing, `getVariableFormat` for each Harbour type (`A`/`H`/`O`/scalars/`E`/`B`/`P`), and `evaluateName` construction including regression coverage for the colon-string and nested-array fixes shipped in 1.0.8

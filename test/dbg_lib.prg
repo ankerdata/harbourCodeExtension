@@ -1550,19 +1550,68 @@ HB_FUNC( __GETLASTRETURN )
    hb_itemReturn( HB_IS_BYREF( pItem ) ? hb_itemUnRef( pItem ) : pItem );
 }
 
+/* Per-thread storage for the debug-info hash.
+ *
+ * Up through Harbour-extension v1.0.11 this was a single C-level static
+ * (PHB_ITEM sDebugInfo), which meant every thread of a multi-threaded
+ * Harbour program shared one socket / one aStack / one breakpoint table
+ * etc.  Concurrent debugger hooks from different threads would clobber
+ * each other.  HB_TSD_NEW (Harbour 3.2+) gives each Harbour thread its
+ * own slot, so each thread independently opens its own socket to the
+ * client (see CheckSocket) and maintains its own debug state.
+ *
+ * xHarbour and pre-3.2 Harbour fall back to the original single-thread
+ * global; multi-threaded debugging is a Harbour-3.2-only feature. */
+#if !defined( __XHARBOUR__ ) && defined( HB_TSD_NEW )
+
+static void s_dbgInfo_init( void * cargo )
+{
+   *( ( PHB_ITEM * ) cargo ) = NULL;
+}
+
+static void s_dbgInfo_clean( void * cargo )
+{
+   PHB_ITEM * ppItem = ( PHB_ITEM * ) cargo;
+   if( *ppItem )
+   {
+      hb_itemRelease( *ppItem );
+      *ppItem = NULL;
+   }
+}
+
+static HB_TSD_NEW( s_dbgInfo, sizeof( PHB_ITEM ), s_dbgInfo_init, s_dbgInfo_clean );
+
+HB_FUNC( __DEBUGITEM )
+{
+   PHB_ITEM * ppItem = ( PHB_ITEM * ) hb_stackGetTSD( &s_dbgInfo );
+   if( !*ppItem )
+   {
+      *ppItem = hb_itemNew( NULL );
+   }
+   if( hb_pcount() > 0 )
+   {
+      hb_itemCopy( *ppItem, hb_param( 1, HB_IT_ANY ) );
+   }
+   hb_itemReturn( *ppItem );
+}
+
+#else /* xHarbour or pre-3.2 Harbour — fall back to the single-thread global */
+
 static PHB_ITEM sDebugInfo = NULL;
 HB_FUNC( __DEBUGITEM )
 {
-   if(!sDebugInfo)
+   if( !sDebugInfo )
    {
-      sDebugInfo = hb_itemNew(0);
+      sDebugInfo = hb_itemNew( 0 );
    }
-   if(hb_pcount()>0)
+   if( hb_pcount() > 0 )
    {
-      hb_itemCopy(sDebugInfo, hb_param(1,HB_IT_ANY));
+      hb_itemCopy( sDebugInfo, hb_param( 1, HB_IT_ANY ) );
    }
-   hb_itemReturn(sDebugInfo);
+   hb_itemReturn( sDebugInfo );
 }
+
+#endif
 
 HB_FUNC( __PIDNUM )
 {
