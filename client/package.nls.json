@@ -18,6 +18,7 @@
   "harbour.launch.workingDir": "Working directory",
   "harbour.launch.arguments": "Arguments to pass to executable",
   "harbour.launch.stopOnEntry": "Automatically stop after launch",
+  "harbour.launch.stopOnEntry.deprecated": "Deprecated and ignored as of 1.1.3 — main always runs to its first breakpoint. Set a breakpoint at the start of main() if you want pause-on-entry behaviour.",
   "harbour.launch.sourcePaths": "Directories where search for source files",
   "harbour.launch.terminalType": "Type of terminal to use to run the application",
   "harbour.launch.port": "Port used by debugger, It must be the same value of DBG_PORT in debugger code line 6",

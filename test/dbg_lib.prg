@@ -412,7 +412,10 @@ return
 static procedure sendStatics(cParams,prefix)
    LOCAL t_oDebugInfo := __DEBUGITEM()
    local aStack := t_oDebugInfo['aStack']
-   local aModules := t_oDebugInfo['aModules']
+   // Module metadata is process-shared (only main runs _INITSTATICS at
+   // startup, so per-thread aModules wouldn't see anything). Pull from the
+   // C-level shared item directly rather than via t_oDebugInfo.
+   local aModules := __DBG_SHAREDMODULES()
    local cModule, idxModule, nVarMod, nVarStack
    local aParams := GetStackAndParams(cParams,aStack)
    local iStack := aParams[1]
@@ -535,7 +538,7 @@ return
 static function MyGetSta(iStack,varIndex)
    LOCAL t_oDebugInfo := __DEBUGITEM()
    local aStack := t_oDebugInfo['aStack']
-   local aModules := t_oDebugInfo['aModules']
+   local aModules := __DBG_SHAREDMODULES()
    LOCAL cModule, idxModule
    local nVarMod, aInfo, nVarStack
    if iStack>0 .and. iStack<=len(aStack)
@@ -785,26 +788,26 @@ static procedure sendCoumpoundVar(req, cParams )
 return
 
 static function IsValidFileName(cModule)
-   LOCAL iModule, t_oDebugInfo := __DEBUGITEM()
+   LOCAL iModule
    //? "IsValidFileName: ", cModule
    cModule := ExtractFileName(cModule)
-   iModule := aScan(t_oDebugInfo['aModules'],{|v| v[1]=cModule})
+   iModule := aScan(__DBG_SHAREDMODULES(),{|v| v[1]=cModule})
    //? cModule, iif(iModule=0," not found","found")
 return iModule
 
 
 static function IsValidStopLine(iModule,nLine)
-   LOCAL t_oDebugInfo := __DEBUGITEM()
    local nIdx, nInfo, tmp
-   if nLine<t_oDebugInfo['aModules'][iModule,2]
+   local aModules := __DBG_SHAREDMODULES()
+   if nLine<aModules[iModule,2]
       return .F.
    endif
-   nIdx := nLine - t_oDebugInfo['aModules'][iModule,2]
+   nIdx := nLine - aModules[iModule,2]
    tmp := Int(nIdx/8)
-   if tmp>=len(t_oDebugInfo['aModules'][iModule,3])
+   if tmp>=len(aModules[iModule,3])
       return .F.
    endif
-   nInfo = Asc(SubStr(t_oDebugInfo['aModules'][iModule,3],tmp+1,1))
+   nInfo = Asc(SubStr(aModules[iModule,3],tmp+1,1))
 return HB_BITAND(HB_BITSHIFT(nInfo, -(nIdx-tmp*8)),1)=1
 
 static procedure setBreakpoint(cInfo)
@@ -994,13 +997,15 @@ static procedure AddModule(aInfo)
       if len(aInfo[i,1])=0
          loop
       endif
-      idx := aScan(t_oDebugInfo['aModules'], {|v| aInfo[i,1]=v[1]})
+      // aModules is shared across threads via __DBG_SHAREDMODULES — see
+      // BEGINDUMP. Always read/write through the shared item directly.
+      idx := aScan(__DBG_SHAREDMODULES(), {|v| aInfo[i,1]=v[1]})
       if idx=0
          aAdd(aInfo[i],{}) //statics
-         aadd(t_oDebugInfo['aModules'],aInfo[i])
+         aadd(__DBG_SHAREDMODULES(),aInfo[i])
       else
-         aAdd(aInfo[i],t_oDebugInfo['aModules'][idx,4])
-         t_oDebugInfo['aModules'][idx] := aInfo[i]
+         aAdd(aInfo[i],__DBG_SHAREDMODULES()[idx,4])
+         __DBG_SHAREDMODULES()[idx] := aInfo[i]
       endif
 
       #ifdef SAVEMODULES
@@ -1022,13 +1027,14 @@ static procedure AddStaticModule(idx,name,frame)
    LOCAL t_oDebugInfo := __DEBUGITEM()
    local currModule := t_oDebugInfo['aStack'][len(t_oDebugInfo['aStack']),HB_DBG_CS_MODULE]
    local idxModule
+   local aModules := __DBG_SHAREDMODULES()
    currModule := lower(alltrim(currModule))
-   idxModule := aScan(t_oDebugInfo['aModules'], {|v| v[1]==currModule})
+   idxModule := aScan(aModules, {|v| v[1]==currModule})
    if idxModule=0
-      aadd(t_oDebugInfo['aModules'],{currModule,0,{},{}})
-      idxModule := len(t_oDebugInfo['aModules'])
+      aadd(aModules,{currModule,0,{},{}})
+      idxModule := len(aModules)
    endif
-   aAdd(t_oDebugInfo['aModules'][idxModule,4],{name,idx,"S",frame})
+   aAdd(aModules[idxModule,4],{name,idx,"S",frame})
 return
 
 static function replaceExpression(xExpr, __dbg, name, value)
@@ -1050,7 +1056,7 @@ static function evalExpression( xExpr, level )
    LOCAL t_oDebugInfo := __DEBUGITEM()
    local aStack := t_oDebugInfo['aStack']
    LOCAL iStack := GetStackId(level,aStack)
-   local aModules := t_oDebugInfo['aModules']
+   local aModules := __DBG_SHAREDMODULES()
    LOCAL cModule, idxModule := 0
    if iStack>0
       cModule := lower(aStack[iStack,HB_DBG_CS_MODULE])
@@ -1169,7 +1175,7 @@ return cResult
 static func normalSymbols(cLine,level)
    LOCAL t_oDebugInfo := __DEBUGITEM()
    local aStack := t_oDebugInfo['aStack']
-   local aModules := t_oDebugInfo['aModules']
+   local aModules := __DBG_SHAREDMODULES()
    LOCAL iLen:=len(cLine), cName
    LOCAL cResult:="", i
    LOCAL iStack := GetStackId(level,aStack)
@@ -1331,13 +1337,18 @@ PROCEDURE __dbgEntry( nMode, uParam1, uParam2, uParam3 )
    switch nMode
       case HB_DBG_MODULENAME
          if(empty(t_oDebugInfo))
+            // Module metadata (line bitmaps, module statics) is process-wide
+            // and accessed via __DBG_SHAREDMODULES() directly — see the
+            // s_pSharedModules comment in BEGINDUMP. It's deliberately NOT
+            // in t_oDebugInfo because hb_itemCopy on hashes clones the value
+            // arrays rather than preserving references, which would defeat
+            // sharing across threads.
             t_oDebugInfo := { ;
                'socket' =>  nil, ;
                'lRunning' =>  .F., ;
                'lInternalRun' => .F., ;
                'aBreaks' =>  {=>}, ;
                'aStack' =>  {}, ;
-               'aModules' =>  {}, ;
                'maxLevel' =>  nil, ;
                'bInitStatics' => .F., ;
                'bInitGlobals' =>  .F., ;
@@ -1533,6 +1544,7 @@ RETURN
 #include <hbstack.h>
 //#include <hbvmint.h>
 #include <hbapiitm.h>
+#include <hbthread.h>  /* HB_CRITICAL_NEW, hb_threadEnter/LeaveCriticalSection */
 #include <stdio.h>
 
 #if defined( HB_OS_UNIX ) || defined( __DJGPP__ )
@@ -1595,6 +1607,38 @@ HB_FUNC( __DEBUGITEM )
    hb_itemReturn( *ppItem );
 }
 
+/* Process-wide shared modules table.
+ *
+ * t_oDebugInfo is per-thread (above), but `aModules` (module name -> line
+ * bitmap + module-static metadata) is identical for every thread of a
+ * given program. It's populated by HB_DBG_MODULENAME / HB_DBG_STATICNAME /
+ * HB_DBG_ENDPROC during the _INITLINES / _INITSTATICS phases, which run
+ * once per program in the main thread before any user thread spawns.
+ * Pre-1.1.0 this happened to work because t_oDebugInfo itself was a single
+ * global; HB_TSD_NEW broke it because worker threads got their own (empty)
+ * aModules and could no longer resolve module statics in evalExpression /
+ * sendStatics / inBreakpoint (Watch panel returned "Variable does not
+ * exist" for any module-level static viewed from a non-main thread). This
+ * shared array restores that visibility without giving up per-thread
+ * isolation for the rest of the debug state. See #34.
+ *
+ * Mutation happens only in main during program startup; after that all
+ * accesses are reads, so no per-access locking is needed. The critical
+ * section guards only the lazy first-touch allocation. */
+static PHB_ITEM s_pSharedModules = NULL;
+static HB_CRITICAL_NEW( s_sharedModulesMutex );
+
+HB_FUNC( __DBG_SHAREDMODULES )
+{
+   hb_threadEnterCriticalSection( &s_sharedModulesMutex );
+   if( !s_pSharedModules )
+   {
+      s_pSharedModules = hb_itemArrayNew( 0 );
+   }
+   hb_threadLeaveCriticalSection( &s_sharedModulesMutex );
+   hb_itemReturn( s_pSharedModules );
+}
+
 #else /* xHarbour or pre-3.2 Harbour — fall back to the single-thread global */
 
 static PHB_ITEM sDebugInfo = NULL;
@@ -1609,6 +1653,19 @@ HB_FUNC( __DEBUGITEM )
       hb_itemCopy( sDebugInfo, hb_param( 1, HB_IT_ANY ) );
    }
    hb_itemReturn( sDebugInfo );
+}
+
+/* xHarbour fallback: no MT support so a plain process-wide static suffices.
+ * Provided so PRG callers can use __DBG_SHAREDMODULES() unconditionally. */
+static PHB_ITEM s_pSharedModules = NULL;
+
+HB_FUNC( __DBG_SHAREDMODULES )
+{
+   if( !s_pSharedModules )
+   {
+      s_pSharedModules = hb_itemArrayNew( 0 );
+   }
+   hb_itemReturn( s_pSharedModules );
 }
 
 #endif

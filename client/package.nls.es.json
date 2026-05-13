@@ -18,6 +18,7 @@
   "harbour.launch.workingDir": "Directorio de trabajo",
   "harbour.launch.arguments": "Argumentos a pasars al ejecutable",
   "harbour.launch.stopOnEntry": "Detener automáticamente después de comenzar",
+  "harbour.launch.stopOnEntry.deprecated": "Obsoleto e ignorado desde 1.1.3 — main siempre se ejecuta hasta su primer punto de interrupción. Establezca un punto de interrupción al inicio de main() si desea el comportamiento de pausa al inicio.",
   "harbour.launch.sourcePaths": "Rutas para buscar código fuente",
   "harbour.launch.terminalType": "Tipo de terminal a utilizar para ejecutar la aplicación",
   "harbour.launch.port": "Puerto utilizado por el depurador, debe ser el mismo valor de DBG_PORT en código del depurador línea 6",

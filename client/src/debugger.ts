@@ -29,6 +29,14 @@ if (platform === "win32") {
   }
 }
 
+/**
+ * Diagnostic log for the post-mortem crash file written when the adapter is
+ * launched as a child process (so stderr is invisible). Entry-point block
+ * (bottom of file) wires this up; class code calls it to add request/response
+ * tracing. No-ops on import if the entry point hasn't run (e.g., under jest).
+ */
+let diagnosticLog: ((kind: string, payload: string) => void) | undefined;
+
 export class HBVar {
   command: string;
   responses: DebugProtocol.VariablesResponse[];
@@ -65,7 +73,6 @@ type LaunchArgs = DebugProtocol.LaunchRequestArguments & {
   workspaceRoot?: string;
   sourcePaths?: string[];
   noDebug?: boolean;
-  stopOnEntry?: boolean;
   terminalType?: "external" | "integrated" | "none";
   program?: string;
   workingDir?: string;
@@ -109,12 +116,12 @@ export class ThreadState {
    */
   localToGlobalRef: Map<number, number> = new Map();
   /**
-   * Set true while a non-main thread has just been auto-GO'd and might still
-   * race a stray "STOP:step" from dbg_lib's CheckSocket sleep+STOP:step branch
-   * (initial state, lStopSent=.F., lRunning=.F. until our GO is processed).
-   * processInput swallows that one racing event and clears the flag on the
-   * first message received from this thread, so legitimate post-step STOP:step
-   * events later are forwarded normally. See #34.
+   * Set true while a non-main thread has just been auto-`GO`d on connect and
+   * might still race a stray `STOP:step` from dbg_lib's `CheckSocket`
+   * sleep+`STOP:step` branch (initial state, `lStopSent=.F.`, `lRunning=.F.`
+   * until our `GO` is processed). `processInput` swallows that one racing
+   * event and clears the flag on the first non-empty line received, so
+   * legitimate post-step `STOP:step` events later are forwarded normally.
    */
   pendingAutoGo: boolean = false;
   stack: DebugProtocol.StackTraceResponse[] = [];
@@ -179,6 +186,66 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
   constructor() {
     super();
+  }
+
+  /**
+   * Diagnostic: trace every incoming DAP request so the post-mortem crash log
+   * shows what the client asked us right before an external kill. Pinpoints
+   * the request whose missing response triggered nvim-dap's disconnect-on-
+   * timeout path (~10–15s window observed in the wild). Cheap (one
+   * appendFileSync per request) and only writes when the entry-point block
+   * has installed `diagnosticLog`, so jest runs aren't affected.
+   */
+  protected dispatchRequest(request: DebugProtocol.Request): void {
+    if (diagnosticLog) {
+      diagnosticLog(
+        "dap-request",
+        `seq=${request.seq} command=${request.command}`,
+      );
+    }
+    super.dispatchRequest(request);
+  }
+
+  /**
+   * Diagnostic: trace every outgoing response so we can pair each request
+   * with its reply (or notice that no reply was sent before the kill).
+   */
+  sendResponse(response: DebugProtocol.Response): void {
+    if (diagnosticLog) {
+      diagnosticLog(
+        "dap-response",
+        `request_seq=${response.request_seq} command=${response.command} success=${response.success}`,
+      );
+    }
+    super.sendResponse(response);
+  }
+
+  /**
+   * Diagnostic: trace every outgoing event so we can see which event
+   * (StoppedEvent? OutputEvent? something synthetic?) is making the client
+   * fire follow-up requests in a loop. Combined with the request trace, the
+   * pair "event X out → continue Y in" pinpoints the runaway feedback loop.
+   */
+  sendEvent(event: DebugProtocol.Event): void {
+    if (diagnosticLog) {
+      let detail = "";
+      if (event.event === "stopped") {
+        const body = (event as DebugProtocol.StoppedEvent).body;
+        detail = ` reason=${body.reason} threadId=${body.threadId} allThreadsStopped=${body.allThreadsStopped}`;
+      } else if (event.event === "thread") {
+        const body = (event as DebugProtocol.ThreadEvent).body;
+        detail = ` reason=${body.reason} threadId=${body.threadId}`;
+      } else if (event.event === "continued") {
+        const body = (event as DebugProtocol.ContinuedEvent).body;
+        detail = ` threadId=${body.threadId} allThreadsContinued=${body.allThreadsContinued}`;
+      } else if (event.event === "output") {
+        const body = (event as DebugProtocol.OutputEvent).body;
+        const out = (body.output ?? "").slice(0, 80).replace(/\r?\n/g, "\\n");
+        detail = ` category=${body.category} output="${out}"`;
+      }
+      diagnosticLog("dap-event", `event=${event.event}${detail}`);
+    }
+    super.sendEvent(event);
   }
 
   get mainThread(): ThreadState {
@@ -281,12 +348,12 @@ export class harbourDebugSession extends debugadapter.DebugSession {
             continue;
           }
           // Auto-GO race window: a freshly-connected non-main thread may have
-          // entered dbg_lib's sleep+STOP:step branch before our auto-GO arrived
-          // (the runtime sends the spurious "STOP:step" after a 100ms sleep
-          // when lStopSent=.F. and lRunning=.F.). Swallow that one racing
-          // event, then clear the flag so subsequent legit STOP:step events
-          // (after a real stepInRequest) are processed normally. The flag is
-          // cleared on the first non-empty line either way.
+          // entered dbg_lib's sleep+STOP:step branch before our auto-`GO`
+          // arrived (the runtime sends the spurious "STOP:step" after a 100ms
+          // sleep when lStopSent=.F. and lRunning=.F.). Swallow that one
+          // racing event, then clear the flag so subsequent legit STOP:step
+          // events (after a real stepInRequest) are processed normally. The
+          // flag is cleared on the first non-empty line either way.
           if (thread.pendingAutoGo) {
             thread.pendingAutoGo = false;
             if (line === "STOP:step") continue;
@@ -305,12 +372,13 @@ export class harbourDebugSession extends debugadapter.DebugSession {
             (stopEvt.body as DebugProtocol.StoppedEvent["body"]).allThreadsStopped =
               false;
             this.sendEvent(stopEvt);
-            this.sendEvent({
-              event: "invalidated",
-              body: { areas: ["variables", "stacks"], threadId: thread.id },
-              seq: 0,
-              type: "event",
-            } as DebugProtocol.Event);
+            // Note: we deliberately do NOT emit a synthetic `invalidated`
+            // event here. Per the DAP spec, "debug adapters do not have to
+            // emit this event for runtime changes like stopped or thread
+            // events because in that case the client refetches the new state
+            // anyway." Sending it caused nvim-dap (which doesn't support
+            // `invalidated`) to log a warning and was implicated in adapter
+            // exit timeouts.
             continue;
           }
           if (line.startsWith("STACK")) {
@@ -427,8 +495,21 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     _args: DebugProtocol.ConfigurationDoneArguments,
   ): void {
     if (this.startGo) {
+      // Same race as worker auto-GO (see acceptThreadSocket): dbg_lib's
+      // CheckSocket may have entered the sleep+STOP:step branch before our
+      // GO arrived, surfacing as a spurious StoppedEvent that paused main on
+      // its first line. Set pendingAutoGo so processInput swallows that one
+      // racing STOP:step. Per #34: only breakpoints (and runtime ERRORs)
+      // should ever stop a thread.
+      this.mainThread.pendingAutoGo = true;
       this.command("GO\r\n");
-      this.sendEvent(new debugadapter.ContinuedEvent(this.mainThread.id, true));
+      // Per-thread continue, not all-threads (#34). At configurationDone
+      // only main exists, but workers may connect concurrently; flagging
+      // allThreadsContinued=true would make the client mis-track those
+      // workers as "running" and re-snapshot them on their first stop.
+      this.sendEvent(
+        new debugadapter.ContinuedEvent(this.mainThread.id, false),
+      );
     }
     this.sendResponse(response);
   }
@@ -455,7 +536,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       }
     }
     this.Debugging = !args.noDebug;
-    this.startGo = args.stopOnEntry === false || args.noDebug === true;
+    // 1.1.3: stopOnEntry is a deprecated no-op. Main and every worker run
+    // unconditionally — only breakpoints (and runtime ERRORs) stop a thread.
+    // Set a breakpoint at the start of main() if you want the old
+    // pause-on-entry behaviour.
+    this.startGo = true;
     const server = net
       .createServer((socket) => tc.evaluateClient(socket, server, args))
       .listen(port);
@@ -738,6 +823,16 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       thread.socket = null;
       if (thread.id !== MAIN_THREAD_ID) {
         tc.threads.delete(thread.id);
+        // Surface a stderr line in addition to ThreadEvent('exited'). VS Code
+        // and nvim-dap render thread exits as silent removal from the threads
+        // panel — without this the user can't tell whether a worker finished
+        // its work normally or crashed/died unexpectedly.
+        tc.sendEvent(
+          new debugadapter.OutputEvent(
+            `Thread ${thread.id} (${thread.name}) exited (socket closed)\r\n`,
+            "stderr",
+          ),
+        );
         tc.sendEvent(new debugadapter.ThreadEvent("exited", thread.id));
       }
     });
@@ -756,13 +851,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     thread.justStart = false;
     thread.queue = "";
 
-    // Auto-GO non-main threads. dbg_lib initialises lRunning=.F. for every
-    // new thread and surfaces a STOP:step after a 100ms sleep when no command
-    // arrives — without this every spawned worker would appear paused on its
-    // first line in VS Code and the user would have to click Continue on each.
-    // Main is excluded because configurationDoneRequest already drives main's
-    // GO (gated on stopOnEntry); duplicating it here would either double-start
-    // or override the user's stopOnEntry choice.
+    // Auto-`GO` non-main threads so workers don't appear paused on first
+    // line via dbg_lib's sleep+`STOP:step` fallback. Main is exempt —
+    // configurationDoneRequest drives main's GO unconditionally. Since 1.1.3
+    // there is no opt-out: only breakpoints (and runtime ERRORs) stop a
+    // thread.
     if (!isFirst) {
       thread.pendingAutoGo = true;
       tc.commandTo(thread, "GO\r\n");
@@ -1635,5 +1728,81 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
 /// END
 if (require.main === module) {
+  // Optional diagnostic: when HARBOUR_DBG_TRACE=1, write every adapter exit
+  // path AND every DAP request/response/event to %TEMP%/harbour-dbg-crash-
+  // <pid>.log. Off by default so production sessions don't pollute %TEMP%
+  // or pay the appendFileSync-per-message overhead. Turn on when reproducing
+  // a hang or silent-exit bug:
+  //   - VS Code: add "env": {"HARBOUR_DBG_TRACE": "1"} to launch.json (the
+  //     adapter inherits the launched-program env, but for the adapter
+  //     itself you'd set it in the user/system env or via "options.env" on
+  //     the DebugAdapterDescriptorFactory).
+  //   - nvim-dap: set vim.env.HARBOUR_DBG_TRACE = "1" before invoking dap.
+  //   - Shell: $env:HARBOUR_DBG_TRACE = "1" (PowerShell) before launching
+  //     VS Code / Neovim.
+  // Logged: startup ping, every signal, exit code, stdin EOF/close/error,
+  // 1-second heartbeat, every dispatched DAP request, every sent response
+  // and event. Combined with the post-mortem invariants this is enough to
+  // distinguish "internal crash" vs "killed by client" vs "request timeout".
+  if (process.env.HARBOUR_DBG_TRACE === "1") {
+    const os = require("os");
+    const fs = require("fs");
+    const path = require("path");
+    const crashLog = path.join(
+      os.tmpdir(),
+      `harbour-dbg-crash-${process.pid}.log`,
+    );
+    const log = (kind: string, payload: string): void => {
+      const entry = `${new Date().toISOString()} pid=${process.pid} ${kind}\n${payload}\n\n`;
+      try {
+        fs.appendFileSync(crashLog, entry);
+      } catch {
+        /* nothing else we can do */
+      }
+      // Always also echo to stderr — some clients (VS Code's debug-adapter
+      // host) DO surface this in the dev tools console.
+      process.stderr.write(`[harbour-dbg ${kind}] ${payload}\n`);
+    };
+    // Expose to the session class so dispatchRequest / sendResponse can
+    // trace. Without this assignment the overrides are no-ops.
+    diagnosticLog = log;
+    log("startup", `argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}`);
+    process.on("uncaughtException", (err) => {
+      const text =
+        err instanceof Error ? err.stack || err.message : String(err);
+      log("uncaughtException", text);
+      process.exit(1);
+    });
+    process.on("unhandledRejection", (reason) => {
+      const text =
+        reason instanceof Error
+          ? reason.stack || reason.message
+          : String(reason);
+      log("unhandledRejection", text);
+    });
+    process.on("exit", (code) => {
+      log("exit", `code=${code}`);
+    });
+    process.on("SIGTERM", () => log("SIGTERM", "received"));
+    process.on("SIGINT", () => log("SIGINT", "received"));
+    // stdin is the DAP transport — if the client closes it (orderly
+    // shutdown) or kills the pipe, this fires. Distinguishes "client
+    // disconnected cleanly" from "process killed externally"
+    // (TerminateProcess on Windows bypasses these handlers entirely; if you
+    // see no `stdin-end` and no `exit` log, the adapter was killed
+    // uncatchably).
+    process.stdin.on("end", () => log("stdin-end", "stdin EOF"));
+    process.stdin.on("close", () => log("stdin-close", "stdin closed"));
+    process.stdin.on("error", (err) => log("stdin-error", String(err)));
+    // Heartbeat: a regular tick proves the event loop is still spinning. If
+    // logs stop heartbeating before exit, something blocked the loop. If
+    // they continue right up to the moment of death, the kill came from
+    // outside. Tight 1s interval so the gap between "last activity" and
+    // "kill" is visible at sub-second resolution.
+    setInterval(
+      () => log("heartbeat", `uptime=${process.uptime().toFixed(1)}s`),
+      1000,
+    ).unref();
+  }
   debugadapter.DebugSession.run(harbourDebugSession);
 }

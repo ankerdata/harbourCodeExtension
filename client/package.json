@@ -314,7 +314,7 @@
               },
               "stopOnEntry": {
                 "type": "boolean",
-                "description": "%harbour.launch.stopOnEntry%",
+                "deprecationMessage": "%harbour.launch.stopOnEntry.deprecated%",
                 "default": false
               },
               "sourcePaths": {

@@ -85,7 +85,7 @@ function findAllEvents<T extends DebugProtocol.Event>(
  * that existing user setups (single-threaded harbour programs) keep working.
  */
 describe("debugger thread dispatch — single-thread baseline", () => {
-  it("processInput STOP:break emits StoppedEvent with threadId=1 + invalidated for variables/stacks", () => {
+  it("processInput STOP:break emits StoppedEvent with threadId=1 and no synthetic invalidated event", () => {
     const { session, events } = makeSession();
 
     session.processInput("STOP:break\r\n");
@@ -95,18 +95,14 @@ describe("debugger thread dispatch — single-thread baseline", () => {
     expect(stopped!.body.reason).toBe("break");
     expect(stopped!.body.threadId).toBe(1);
 
+    // 1.1.3: we no longer emit a synthetic `invalidated` event after STOP.
+    // Per the DAP spec, the client refetches state on `stopped`, so the
+    // extra event was redundant — and nvim-dap doesn't handle it.
     const invalidated = findEvent<DebugProtocol.InvalidatedEvent>(
       events,
       "invalidated",
     );
-    expect(invalidated).toBeDefined();
-    // The runtime carries threadId=1 too — VS Code uses it to know which thread's
-    // panes to refresh. After MT support, this must follow the stopping thread.
-    expect((invalidated!.body as { threadId?: number }).threadId).toBe(1);
-    expect((invalidated!.body as { areas?: string[] }).areas).toEqual([
-      "variables",
-      "stacks",
-    ]);
+    expect(invalidated).toBeUndefined();
   });
 
   it("processInput STOP:pause emits StoppedEvent reason='pause' threadId=1", () => {
@@ -147,7 +143,7 @@ describe("debugger thread dispatch — single-thread baseline", () => {
     expect(findEvent(events, "stopped")).toBeUndefined();
   });
 
-  it("configurationDoneRequest with startGo=true emits ContinuedEvent threadId=1 allThreadsContinued=true", () => {
+  it("configurationDoneRequest with startGo=true emits ContinuedEvent threadId=1 allThreadsContinued=false and arms pendingAutoGo on main", () => {
     const { session, events } = makeSession();
     session.startGo = true;
     (
@@ -171,12 +167,16 @@ describe("debugger thread dispatch — single-thread baseline", () => {
     const cont = findEvent<DebugProtocol.ContinuedEvent>(events, "continued");
     expect(cont).toBeDefined();
     expect(cont!.body.threadId).toBe(1);
-    // Until we have per-thread continue, GO continues "all threads" — which is
-    // accurate today (there's only one) and remains accurate after MT support if
-    // GO is interpreted as "continue the runtime", not "continue this thread".
+    // Per #34: per-thread continue, not all-threads. Workers may connect
+    // concurrently; flagging allThreadsContinued=true would make the client
+    // mis-track them as running and re-snapshot on first stop.
     expect(
       (cont!.body as { allThreadsContinued?: boolean }).allThreadsContinued,
-    ).toBe(true);
+    ).toBe(false);
+    // Per #34: dbg_lib's CheckSocket sleep+STOP:step branch races our GO.
+    // Arming pendingAutoGo on main means the racing STOP:step is swallowed
+    // by processInput rather than surfacing as a phantom first-line stop.
+    expect(session.mainThread.pendingAutoGo).toBe(true);
   });
 
   it("configurationDoneRequest with startGo=false does NOT emit ContinuedEvent (stopOnEntry path)", () => {
@@ -250,13 +250,10 @@ describe("ThreadState routing — phase 2 (multi-socket)", () => {
 
     const stopped = findEvent<DebugProtocol.StoppedEvent>(events, "stopped");
     expect(stopped).toBeDefined();
+    // The StoppedEvent's threadId proves processInput pivoted onto the
+    // supplied thread for the duration of the call (it was sourced from
+    // currentThread.id at emit time). No second event needed for this.
     expect(stopped!.body.threadId).toBe(7);
-
-    const invalidated = findEvent<DebugProtocol.InvalidatedEvent>(
-      events,
-      "invalidated",
-    );
-    expect((invalidated!.body as { threadId?: number }).threadId).toBe(7);
 
     // currentThread is restored to the previous value after the call so DAP
     // request handlers (which still default to mainThread) don't see leakage.
@@ -560,8 +557,8 @@ describe("Phase 3: per-thread control requests", () => {
     ) as DebugProtocol.ThreadEvent[];
     const secId = startedEvents[0].body.threadId;
     const secondary = session.threads.get(secId)!;
-    // Drop the auto-GO write + race-window flag so tests start from a clean
-    // state. Tests that explicitly exercise the auto-GO behaviour go through
+    // Scrub the default auto-GO write + race-window flag so tests start from a
+    // clean state. Tests that explicitly exercise auto-GO drive
     // acceptThreadSocket directly rather than this helper.
     secondSocket.written.length = 0;
     secondary.pendingAutoGo = false;
@@ -722,8 +719,8 @@ describe("Phase 4: per-thread variable inspection routing", () => {
     ) as DebugProtocol.ThreadEvent[];
     const secId = startedEvents[0].body.threadId;
     const secondary = session.threads.get(secId)!;
-    // Drop the auto-GO write + race-window flag so tests start from a clean
-    // state. Tests that explicitly exercise auto-GO go through
+    // Scrub the default auto-GO write + race-window flag so tests start from a
+    // clean state. Tests that explicitly exercise auto-GO drive
     // acceptThreadSocket directly rather than this helper.
     secondSocket.written.length = 0;
     secondary.pendingAutoGo = false;
@@ -1034,10 +1031,10 @@ describe("Phase 4: per-thread variable inspection routing", () => {
 });
 
 /**
- * Phase 5 (issue #34): per-thread stop/continue UX.
+ * Phase 5 (issue #34): per-thread stop/continue UX — DAP-shape fixes.
  *
- * Three adapter-side bugs were causing MT debugging to feel like an all-stop
- * debugger even though the runtime was per-thread:
+ * Two adapter-side bugs caused MT debugging to feel like an all-stop debugger
+ * even though the runtime was per-thread:
  *
  * - StoppedEvent omitted `allThreadsStopped` — VS Code's UI fell into all-stop
  *   semantics (other threads marked paused, focus ricocheting on next stop).
@@ -1045,14 +1042,17 @@ describe("Phase 4: per-thread variable inspection routing", () => {
  *   `true`, so VS Code thought every thread continued and re-snapshotted
  *   unrelated threads on the next stop event ("main stops wherever it is
  *   executing").
- * - Newly-connected threads never got an auto-GO, so dbg_lib's fallback
- *   sleep+STOP:step branch made every spawned worker appear paused on its
- *   first line, requiring the user to click Continue per thread.
  *
- * These tests pin the corrected behaviour: explicit `allThreadsStopped=false`
+ * These tests pin the corrected wire shape: explicit `allThreadsStopped=false`
  * on every StoppedEvent, explicit `allThreadsContinued=false` on every
- * per-thread continue, and auto-GO for non-main threads with a one-shot
- * swallow of the racing initial STOP:step.
+ * per-thread continue.
+ *
+ * (We initially also auto-GO'd non-main threads on connect to suppress
+ * dbg_lib's "appear paused on first line" artefact, but that broke real apps
+ * relying on the implicit pause as a worker→main sync barrier — workers
+ * reached app code before main finished init, surfacing uninitialised module
+ * statics and triggering infinite error-handler recursion. Reverted; deferred
+ * to an opt-in launch-config flag.)
  */
 describe("Phase 5: per-thread stop/continue UX (#34)", () => {
   it("processInput STOP marks the event as allThreadsStopped=false (only the stopping thread is paused)", () => {
@@ -1101,7 +1101,7 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     ).toBe(false);
   });
 
-  it("acceptThreadSocket on a non-main socket dispatches GO and sets pendingAutoGo (so threads don't appear paused on first line)", () => {
+  it("acceptThreadSocket auto-GOs non-main threads and sets pendingAutoGo", () => {
     const { session, events } = makeSession();
     const fakeServer = {} as unknown as import("net").Server;
     const accept = (
@@ -1112,9 +1112,7 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
 
     const first = new FakeSocket();
     accept(first, fakeServer);
-    // Main thread does NOT auto-GO from acceptThreadSocket. configurationDone
-    // owns that, gated on stopOnEntry — duplicating it here would override the
-    // user's stopOnEntry choice.
+    // Main is exempt from auto-GO — configurationDone owns main's GO.
     expect(first.written).not.toContain("GO\r\n");
     expect(session.mainThread.pendingAutoGo).toBe(false);
 
@@ -1129,11 +1127,12 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     expect(session.threads.get(newId)!.pendingAutoGo).toBe(true);
   });
 
-  it("processInput swallows a racing initial STOP:step from a pendingAutoGo thread (no StoppedEvent emitted)", () => {
-    // Simulates the dbg_lib race: our auto-GO was sent, but dbg_lib's CheckSocket
-    // had already fallen into the sleep+STOP:step branch before reading our
-    // command. The spurious STOP:step must not surface as a StoppedEvent in
-    // VS Code, otherwise the freshly-spawned thread blinks "paused".
+  it("processInput swallows the racing initial STOP:step from a pendingAutoGo thread (no StoppedEvent emitted)", () => {
+    // Simulates the dbg_lib race: our auto-GO was sent, but dbg_lib's
+    // CheckSocket had already fallen into the sleep+STOP:step branch before
+    // reading our command. The spurious STOP:step must not surface as a
+    // StoppedEvent in VS Code, otherwise the freshly-spawned thread blinks
+    // "paused".
     const { session, events } = makeSession();
     const secondary = new ThreadState(7);
     secondary.pendingAutoGo = true;
@@ -1145,10 +1144,10 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     expect(secondary.pendingAutoGo).toBe(false);
   });
 
-  it("processInput does NOT swallow non-step initial messages — a real breakpoint hit on a fresh thread is still surfaced", () => {
-    // If the new thread's very first line is a real breakpoint (STOP:break),
-    // we must forward it. The pendingAutoGo flag still gets cleared because
-    // the race window is over by the time any STOP arrives.
+  it("processInput does NOT swallow a non-step initial message — a real breakpoint hit on a fresh thread is still surfaced", () => {
+    // If the new thread's very first emitted line is a real breakpoint
+    // (STOP:break), forward it. The pendingAutoGo flag still gets cleared
+    // because the race window is over by the time any STOP arrives.
     const { session, events } = makeSession();
     const secondary = new ThreadState(7);
     secondary.pendingAutoGo = true;
@@ -1163,10 +1162,10 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     expect(secondary.pendingAutoGo).toBe(false);
   });
 
-  it("the STOP:step swallow is one-shot — a later legitimate STOP:step (after a real stepIn) is processed normally", () => {
+  it("the swallow is one-shot — a later legitimate post-stepIn STOP:step is processed normally", () => {
     // Without this guarantee, if our auto-GO won the race (dbg_lib processed
     // it before sleeping, no spurious STOP:step ever arrived), pendingAutoGo
-    // would stay true forever and incorrectly swallow the *next* legitimate
+    // would stay true forever and incorrectly swallow the next legitimate
     // post-stepIn STOP:step. Clearing the flag on the first non-empty line
     // (whether it's the racing STOP:step or anything else) prevents that.
     const { session, events } = makeSession();
@@ -1186,24 +1185,53 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     expect(stopped!.body.threadId).toBe(7);
   });
 
-  it("pendingAutoGo is per-thread — clearing one thread's flag doesn't affect another's", () => {
+  it("close on a non-main socket emits a stderr OutputEvent in addition to ThreadEvent('exited')", () => {
+    // Without the OutputEvent the user has no signal that a worker thread
+    // died unexpectedly — both VS Code and nvim-dap render ThreadEvent('exited')
+    // as silent removal from the threads panel.
     const { session, events } = makeSession();
-    const a = new ThreadState(7);
-    const b = new ThreadState(8);
-    a.pendingAutoGo = true;
-    b.pendingAutoGo = true;
-    session.threads.set(7, a);
-    session.threads.set(8, b);
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+    accept(new FakeSocket(), fakeServer);
+    const second = new FakeSocket();
+    accept(second, fakeServer);
 
-    // Thread A processes its racing STOP:step → swallowed, A's flag clears.
-    session.processInput("STOP:step\r\n", a);
-    expect(a.pendingAutoGo).toBe(false);
-    expect(b.pendingAutoGo).toBe(true);
-    expect(findEvent(events, "stopped")).toBeUndefined();
+    second.emit("close");
 
-    // Thread B's racing STOP:step also swallowed independently.
-    session.processInput("STOP:step\r\n", b);
-    expect(b.pendingAutoGo).toBe(false);
-    expect(findEvent(events, "stopped")).toBeUndefined();
+    const outputEvts = findAllEvents<DebugProtocol.OutputEvent>(
+      events,
+      "output",
+    ).filter((e) => e.body.category === "stderr");
+    expect(outputEvts.length).toBeGreaterThanOrEqual(1);
+    expect(outputEvts.some((e) => /exited/i.test(e.body.output))).toBe(true);
+    // The ThreadEvent still fires too.
+    const exitedEvts = findAllEvents<DebugProtocol.ThreadEvent>(
+      events,
+      "thread",
+    ).filter((e) => e.body.reason === "exited");
+    expect(exitedEvts).toHaveLength(1);
+  });
+
+  it("close on the main socket does NOT emit the stderr OutputEvent (main close = session end, expected)", () => {
+    const { session, events } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const main = new FakeSocket();
+    (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket(main, fakeServer);
+
+    main.emit("close");
+
+    const outputEvts = findAllEvents<DebugProtocol.OutputEvent>(
+      events,
+      "output",
+    ).filter((e) => /exited/i.test(e.body.output));
+    expect(outputEvts).toHaveLength(0);
   });
 });
