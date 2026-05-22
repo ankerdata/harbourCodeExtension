@@ -151,6 +151,15 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   processInterval: NodeJS.Timeout | undefined = undefined;
   startGo: boolean = false;
 
+  /**
+   * Last `ERRORTYPE` value broadcast to live threads (computed from the
+   * client's `setExceptionBreakpointsRequest`). Replayed to every newly-
+   * connected worker in `acceptThreadSocket` so the runtime's per-thread
+   * `t_oDebugInfo['errorType']` matches what the user configured. `null`
+   * means the client hasn't set it yet, so there's nothing to replay.
+   */
+  private currentErrorType: number | null = null;
+
   /** Live harbour threads, keyed by harbour thread id. Bootstraps with the main thread. */
   threads: Map<number, ThreadState> = new Map([
     [MAIN_THREAD_ID, new ThreadState(MAIN_THREAD_ID)],
@@ -800,8 +809,16 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
     socket.removeAllListeners("data");
     socket.on("data", (data2) => {
+      const text = data2.toString();
+      if (diagnosticLog) {
+        const preview = text.replace(/\r?\n/g, "\\n").slice(0, 200);
+        diagnosticLog(
+          "wire-in",
+          `thread=${thread.id} bytes=${text.length} data="${preview}"`,
+        );
+      }
       try {
-        tc.processInput(data2.toString(), thread);
+        tc.processInput(text, thread);
       } catch (error) {
         tc.sendEvent(
           new debugadapter.OutputEvent(
@@ -851,12 +868,21 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     thread.justStart = false;
     thread.queue = "";
 
-    // Auto-`GO` non-main threads so workers don't appear paused on first
-    // line via dbg_lib's sleep+`STOP:step` fallback. Main is exempt —
-    // configurationDoneRequest drives main's GO unconditionally. Since 1.1.3
-    // there is no opt-out: only breakpoints (and runtime ERRORs) stop a
-    // thread.
+    // Replay session-wide debugger state to the new worker BEFORE the
+    // auto-GO so it doesn't run past breakpoints or fail to honour the
+    // user's exception-stop setting. Both lists live per-thread in dbg_lib's
+    // `t_oDebugInfo` (`aBreaks`, `errorType`) and would otherwise stay at
+    // the worker's empty defaults. Order matters: the worker is in
+    // CheckSocket between handshake and GO, so it processes ERRORTYPE +
+    // BREAKPOINT messages synchronously and then the GO unblocks execution.
     if (!isFirst) {
+      if (this.currentErrorType !== null) {
+        tc.commandTo(thread, `ERRORTYPE\r\n${this.currentErrorType}\r\n`);
+      }
+      const bpReplay = this.currentBreakpointsMessage();
+      if (bpReplay.length > 0) {
+        tc.commandTo(thread, bpReplay);
+      }
       thread.pendingAutoGo = true;
       tc.commandTo(thread, "GO\r\n");
     }
@@ -924,7 +950,57 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     this.commandTo(this.currentThread, cmd);
   }
 
+  /**
+   * Send `cmd` to every live thread's socket (or queue, if pre-handshake).
+   * Used for BREAKPOINT and ERRORTYPE updates, where dbg_lib stores state
+   * per-thread in `t_oDebugInfo['aBreaks']` / `t_oDebugInfo['errorType']`
+   * (made per-thread by the 1.1.0 HB_TSD_NEW change). Without broadcasting,
+   * only main's runtime gets the breakpoint installed and worker threads
+   * silently never fire any breakpoint.
+   */
+  private broadcastCommand(cmd: string): void {
+    if (cmd.length === 0) return;
+    for (const thread of this.threads.values()) {
+      this.commandTo(thread, cmd);
+    }
+  }
+
+  /**
+   * Build a BREAKPOINT wire message representing the full current breakpoint
+   * set (every active line across every source). Used to replay state to a
+   * newly-connected worker thread before its auto-GO so it doesn't run past
+   * breakpoints set before it spawned. `this.breakpoints[src][line]` stores
+   * a non-`-`-prefixed string when the breakpoint is live; tombstones (the
+   * literal `"-"`) and pending-removal markers (`"-...prefix"`) are skipped.
+   */
+  private currentBreakpointsMessage(): string {
+    const parts: string[] = [];
+    for (const src of Object.keys(this.breakpoints)) {
+      const dest = this.breakpoints[src];
+      for (const key of Object.keys(dest)) {
+        if (key === "response") continue;
+        const v = dest[key];
+        if (typeof v === "string" && !v.startsWith("-")) {
+          parts.push(v, "\r\n");
+        }
+      }
+    }
+    return parts.join("");
+  }
+
   commandTo(thread: ThreadState, cmd: string): void {
+    if (diagnosticLog) {
+      const dest = thread.justStart
+        ? "queue"
+        : thread.socket && !thread.socket.destroyed
+          ? "socket"
+          : "dropped";
+      const preview = cmd.replace(/\r?\n/g, "\\n").slice(0, 120);
+      diagnosticLog(
+        "wire-out",
+        `thread=${thread.id} dest=${dest} bytes=${cmd.length} cmd="${preview}"`,
+      );
+    }
     if (thread.justStart) {
       thread.queue += cmd;
     } else if (thread.socket && !thread.socket.destroyed) {
@@ -1504,7 +1580,13 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       }
     }
     this.checkBreakPoint(src);
-    this.command(messageParts.join(""));
+    // dbg_lib stores `aBreaks` per-thread (HB_TSD_NEW since 1.1.0), so a
+    // BREAKPOINT only reaches the worker that consumes it. Broadcast the
+    // delta to every live thread so a breakpoint set after workers have
+    // already spawned still installs everywhere. Fresh workers that connect
+    // after this point are seeded by acceptThreadSocket replaying the full
+    // current set on connect.
+    this.broadcastCommand(messageParts.join(""));
   }
 
   processBreak(line: string): void {
@@ -1576,7 +1658,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     if (errorType === 1 && args.filters[0] !== "notSeq") {
       errorType++;
     }
-    this.command(`ERRORTYPE\r\n${errorType}\r\n`);
+    // Per-thread storage in dbg_lib (`t_oDebugInfo['errorType']`); same
+    // broadcast + replay-on-connect pattern as BREAKPOINT — see
+    // setBreakPointsRequest and acceptThreadSocket.
+    this.currentErrorType = errorType;
+    this.broadcastCommand(`ERRORTYPE\r\n${errorType}\r\n`);
     this.sendResponse(response);
   }
 

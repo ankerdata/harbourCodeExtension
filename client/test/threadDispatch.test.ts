@@ -1235,3 +1235,231 @@ describe("Phase 5: per-thread stop/continue UX (#34)", () => {
     expect(outputEvts).toHaveLength(0);
   });
 });
+
+/**
+ * Phase 6 (issue #34): per-thread breakpoint and exception-filter state.
+ *
+ * dbg_lib stores `aBreaks` and `errorType` per-thread in `t_oDebugInfo`
+ * (HB_TSD_NEW since 1.1.0). The adapter previously sent BREAKPOINT and
+ * ERRORTYPE only to `currentThread` (== mainThread by default), so worker
+ * threads silently ran with empty `aBreaks` — breakpoints set in the
+ * editor never fired in any non-main thread. These tests pin two fixes:
+ *
+ *  - setBreakPointsRequest / setExceptionBreakPointsRequest broadcast the
+ *    delta to every live thread on update.
+ *  - acceptThreadSocket replays the full current state (BREAKPOINT for
+ *    every active line, plus the last-broadcast ERRORTYPE) to a newly-
+ *    connected worker BEFORE its auto-GO so it doesn't run past
+ *    breakpoints set before it spawned.
+ */
+describe("Phase 6: per-thread breakpoint state replay (#34)", () => {
+  function setupTwoLiveThreads(): {
+    session: harbourDebugSession;
+    main: FakeSocket;
+    worker: FakeSocket;
+    workerThread: ThreadState;
+  } {
+    const { session } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+
+    const main = new FakeSocket();
+    accept(main, fakeServer);
+    const worker = new FakeSocket();
+    accept(worker, fakeServer);
+    const workerThread = [...session.threads.values()].find(
+      (t) => t.id !== MAIN_THREAD_ID,
+    )!;
+    // Scrub the auto-GO write so the assertions below see only what the
+    // method-under-test wrote (the test then exercises BREAKPOINT/ERRORTYPE).
+    main.written.length = 0;
+    worker.written.length = 0;
+    workerThread.pendingAutoGo = false;
+    return { session, main, worker, workerThread };
+  }
+
+  it("setBreakPointsRequest broadcasts BREAKPOINT to every live thread, not just main", () => {
+    const { session, main, worker } = setupTwoLiveThreads();
+
+    (
+      session as unknown as {
+        setBreakPointsRequest: (
+          r: DebugProtocol.SetBreakpointsResponse,
+          a: DebugProtocol.SetBreakpointsArguments,
+        ) => void;
+      }
+    ).setBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setBreakpoints",
+        seq: 0,
+        body: { breakpoints: [] },
+      },
+      {
+        source: { name: "test.prg", path: "test.prg" },
+        breakpoints: [{ line: 42 }],
+      },
+    );
+
+    const expected = "BREAKPOINT\r\n+:test.prg:42\r\n";
+    expect(main.written.join("")).toContain(expected);
+    expect(worker.written.join("")).toContain(expected);
+  });
+
+  it("setExceptionBreakPointsRequest broadcasts ERRORTYPE to every live thread", () => {
+    const { session, main, worker } = setupTwoLiveThreads();
+
+    (
+      session as unknown as {
+        setExceptionBreakPointsRequest: (
+          r: DebugProtocol.SetExceptionBreakpointsResponse,
+          a: DebugProtocol.SetExceptionBreakpointsArguments,
+        ) => void;
+      }
+    ).setExceptionBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setExceptionBreakpoints",
+        seq: 0,
+      },
+      { filters: ["all"] },
+    );
+
+    expect(main.written.join("")).toContain("ERRORTYPE\r\n");
+    expect(worker.written.join("")).toContain("ERRORTYPE\r\n");
+  });
+
+  it("acceptThreadSocket replays current breakpoints + ERRORTYPE to a new worker BEFORE its auto-GO", () => {
+    // Set state when only main is connected, then spawn a worker and
+    // verify its socket sees BREAKPOINT and ERRORTYPE before GO.
+    const { session } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+
+    const main = new FakeSocket();
+    accept(main, fakeServer);
+    main.written.length = 0;
+
+    (
+      session as unknown as {
+        setBreakPointsRequest: (
+          r: DebugProtocol.SetBreakpointsResponse,
+          a: DebugProtocol.SetBreakpointsArguments,
+        ) => void;
+      }
+    ).setBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setBreakpoints",
+        seq: 0,
+        body: { breakpoints: [] },
+      },
+      {
+        source: { name: "test.prg", path: "test.prg" },
+        breakpoints: [{ line: 42 }, { line: 99 }],
+      },
+    );
+    (
+      session as unknown as {
+        setExceptionBreakPointsRequest: (
+          r: DebugProtocol.SetExceptionBreakpointsResponse,
+          a: DebugProtocol.SetExceptionBreakpointsArguments,
+        ) => void;
+      }
+    ).setExceptionBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setExceptionBreakpoints",
+        seq: 0,
+      },
+      { filters: ["all"] },
+    );
+
+    // Now the worker arrives — it should receive ERRORTYPE + BREAKPOINTs + GO.
+    const worker = new FakeSocket();
+    accept(worker, fakeServer);
+    const wire = worker.written.join("");
+
+    expect(wire).toContain("ERRORTYPE\r\n");
+    expect(wire).toContain("BREAKPOINT\r\n+:test.prg:42");
+    expect(wire).toContain("BREAKPOINT\r\n+:test.prg:99");
+    expect(wire).toContain("GO\r\n");
+
+    // Order matters: ERRORTYPE + BREAKPOINTs MUST land before GO. The
+    // worker is in dbg_lib's CheckSocket between handshake and GO; if GO
+    // arrives first, it leaves CheckSocket and runs past breakpoints
+    // before the BREAKPOINT messages are processed.
+    const goIdx = wire.indexOf("GO\r\n");
+    const errIdx = wire.indexOf("ERRORTYPE\r\n");
+    const bpIdx = wire.indexOf("BREAKPOINT\r\n");
+    expect(errIdx).toBeGreaterThanOrEqual(0);
+    expect(bpIdx).toBeGreaterThanOrEqual(0);
+    expect(errIdx).toBeLessThan(goIdx);
+    expect(bpIdx).toBeLessThan(goIdx);
+  });
+
+  it("acceptThreadSocket on a worker sends NO ERRORTYPE replay if the client never set it", () => {
+    // Don't send setExceptionBreakpoints. New worker should not get a
+    // synthetic ERRORTYPE (currentErrorType is null).
+    const { session } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+
+    accept(new FakeSocket(), fakeServer);
+    const worker = new FakeSocket();
+    accept(worker, fakeServer);
+
+    expect(worker.written.join("")).not.toContain("ERRORTYPE\r\n");
+    // GO is still sent (auto-GO is unconditional for non-main).
+    expect(worker.written.join("")).toContain("GO\r\n");
+  });
+
+  it("setBreakPointsRequest on a single-thread session still reaches the (only) main thread", () => {
+    // Sanity: single-thread baseline didn't regress. Pre-handshake, commandTo
+    // queues onto the thread's pending buffer; that buffer is drained to the
+    // socket inside acceptThreadSocket once main connects.
+    const { session } = makeSession();
+    (
+      session as unknown as {
+        setBreakPointsRequest: (
+          r: DebugProtocol.SetBreakpointsResponse,
+          a: DebugProtocol.SetBreakpointsArguments,
+        ) => void;
+      }
+    ).setBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setBreakpoints",
+        seq: 0,
+        body: { breakpoints: [] },
+      },
+      {
+        source: { name: "test.prg", path: "test.prg" },
+        breakpoints: [{ line: 7 }],
+      },
+    );
+    expect(session.mainThread.queue).toContain("BREAKPOINT\r\n+:test.prg:7");
+  });
+});
