@@ -695,6 +695,20 @@ export class Provider {
     } else {
       words[1] = "";
     }
+    // `THREAD STATIC` / `THREAD LOCAL` declarations carry a leading `thread`
+    // qualifier; drop it so the rest is parsed (and, crucially for rename,
+    // scoped) exactly like a plain STATIC/LOCAL declaration. Without this the
+    // declaration is unrecognised, no symbol is recorded, and the name is
+    // treated as global — so e.g. renaming it escapes its own file.
+    if (
+      words[0] === "thread" &&
+      words.length > 2 &&
+      (words[1] === "static" || words[1] === "local")
+    ) {
+      words.shift();
+      words1 = words[1];
+      words[1] = words[1].toLowerCase();
+    }
     if (words[0][0] === "#") {
       if (words[0] === "#include") {
         //TODO: check if words1 first and last letter are "" or <>

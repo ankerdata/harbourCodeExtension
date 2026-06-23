@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Harbour Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/client"],
+      "outFiles": ["${workspaceFolder}/client/dist/**/*.js"],
+      "preLaunchTask": "build:dev"
+    }
+  ]
+}
