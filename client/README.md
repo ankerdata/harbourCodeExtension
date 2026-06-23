@@ -14,6 +14,7 @@ do you like this extension? Help me to make it better with a donation, click the
 - [Diagnostic infos](https://github.com/APerricone/harbourCodeExtension/wiki/Diagnostics-Lint)
 - Symbol Definitions Within a Document provider (access it by pressing <kbd>CTRL</kbd>+<kbd>SHIFT</kbd>+<kbd>O</kbd> or <kbd>CTRL</kbd>+<kbd>P</kbd> then <kbd>@</kbd>)
 - Symbol Definitions in workspace provider (access it by pressing <kbd>CTRL</kbd>+<kbd>T</kbd> or <kbd>CTRL</kbd>+<kbd>P</kbd> then <kbd>#</kbd>)
+- Rename Symbol — rename a function, procedure, method, class DATA member, local or parameter and have every occurrence updated (access it by pressing <kbd>F2</kbd> on the symbol). Cross-file for workspace-wide symbols; correctly scoped to the current routine for locals/parameters and to the current file for module-static symbols.
 
 ## Documentation links
 See the [wiki](https://github.com/APerricone/harbourCodeExtension/wiki) for more information.

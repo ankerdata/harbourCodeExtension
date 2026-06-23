@@ -6,6 +6,7 @@ import { URI as Uri } from "vscode-uri";
 import * as trueCase from "true-case-path";
 import * as server_textdocument from "vscode-languageserver-textdocument";
 import { isHarbourGeneratedCFile } from "./workspaceScan";
+import * as rename from "./rename";
 
 interface FieldInfo {
   name: string;
@@ -123,6 +124,9 @@ connection.onInitialize((params) => {
       workspaceSymbolProvider: true,
       definitionProvider: true,
       referencesProvider: true,
+      renameProvider: {
+        prepareProvider: true,
+      },
       // declarationProvider: true,
       signatureHelpProvider: {
         triggerCharacters: ["("],
@@ -677,7 +681,12 @@ function GetWord(
     }
     delta += 10;
   }
-  const worldPos = pos - delta + word.index;
+  // The window starts at Math.max(pos - delta, 0); word.index is relative to
+  // it, so the absolute offset must use the same clamped start. Using the raw
+  // `pos - delta` is only correct when pos >= delta and otherwise shifts the
+  // result left near the start of the file (which broke prepareRename ranges
+  // for symbols defined on the first lines).
+  const worldPos = Math.max(pos - delta, 0) + word.index;
   const wordStr = word[0];
   return withPrev ? [wordStr, prev ?? "", worldPos] : wordStr;
 }
@@ -2011,7 +2020,20 @@ connection.onRequest(
   },
 );
 
-connection.onReferences((params) => {
+// Resolve the symbol under the cursor and gather all of its occurrences,
+// shared by Find-All-References and Rename. Returns undefined when there is
+// no identifier at the position.
+function resolveSymbolAt(
+  params: server.TextDocumentPositionParams,
+): {
+  doc: server_textdocument.TextDocument;
+  docUri: string;
+  pThis: provider.Provider;
+  wordStr: string;
+  wordOffset: number;
+  scope: rename.RenameScope;
+  locations: server.Location[];
+} | undefined {
   const w = GetWord(params, true);
   if ((w as string | unknown[]).length === 0) return undefined;
   const wTuple = w as [string, string, number];
@@ -2020,81 +2042,81 @@ connection.onReferences((params) => {
   const docUri = canonicalUri(doc.uri);
   const prev = wTuple[1];
   const next = getNextNotSpace(doc, wTuple[2] + wTuple[0].length);
-  let kind = "variable";
-  if (prev === ":") kind = next === "(" ? "method" : "data";
-  else kind = next === "(" ? "function" : "variable";
-  if (prev === "->") kind = "field";
-  const ret: server.Location[] = [];
   const word = wTuple[0].toLowerCase();
-  let pThis: provider.Provider;
-  if (docUri in files) pThis = files[docUri];
-  else pThis = getDocumentProvider(doc);
-  const reqLine = params.position.line;
-  const def = pThis.funcList.find(
-    (v) =>
-      v.nameCmp === word &&
-      (v.parent === undefined ||
-        (v.parent.startLine <= reqLine &&
-          (v.parent.endLine === undefined || v.parent.endLine >= reqLine))),
+  // Resolve scope against a *full* parse of the live buffer. The workspace
+  // scan stores light-mode providers (`Provider(true)`) that lag the editor
+  // until an unrelated edit triggers a full re-parse via parseDocument — which
+  // is exactly why a freshly-opened file's static procedure could report
+  // "can't be renamed" (its definition wasn't resolvable in the cached parse)
+  // and then become renameable after any edit. Re-parse here whenever we'd
+  // otherwise lean on a light provider so rename never depends on that timing.
+  let pThis = docUri in files ? files[docUri] : getDocumentProvider(doc);
+  if (pThis.light) pThis = parseDocument(doc);
+  const scope = rename.resolveScope(
+    pThis,
+    word,
+    prev,
+    next,
+    params.position.line,
   );
-  let onlyThis = false;
-  if (def) {
-    kind = def.kind;
-    if (def.kind.endsWith("*")) {
-      onlyThis = true;
-      kind = kind.substring(0, kind.length - 1);
-    }
-    if (def.kind === "local") onlyThis = true;
-    if (def.kind === "static") onlyThis = true;
-    if (def.kind === "param") onlyThis = true;
-  }
-  if (word in pThis.references) {
-    for (let i = 0; i < pThis.references[word].length; i++) {
-      const ref = pThis.references[word][i];
-      if (ref.type !== kind) continue;
-      if (def && def.parent && onlyThis) {
-        if (ref.line < def.parent.startLine) continue;
-        if (def.parent.endLine !== undefined && ref.line > def.parent.endLine)
-          continue;
-      }
-      ret.push(
-        server.Location.create(
-          docUri,
-          server.Range.create(
-            ref.line,
-            ref.col,
-            ref.line,
-            ref.col + word.length,
-          ),
-        ),
-      );
-    }
-  }
+  const locations = rename.collectLocations(files, docUri, pThis, scope);
+  return {
+    doc,
+    docUri,
+    pThis,
+    wordStr: wTuple[0],
+    wordOffset: wTuple[2],
+    scope,
+    locations,
+  };
+}
 
-  if (!onlyThis)
-    for (const file in files) {
-      if (file === docUri) continue;
-      const pp = files[file];
-      if (word in pp.references) {
-        for (let i = 0; i < pp.references[word].length; i++) {
-          const ref = pp.references[word][i];
-          if (ref.type === kind) {
-            ret.push(
-              server.Location.create(
-                file,
-                server.Range.create(
-                  ref.line,
-                  ref.col,
-                  ref.line,
-                  ref.col + word.length,
-                ),
-              ),
-            );
-          }
-        }
-      }
-    }
-  return ret;
+connection.onReferences((params) => {
+  const r = resolveSymbolAt(params);
+  if (!r) return undefined;
+  return r.locations;
+});
+
+connection.onPrepareRename((params) => {
+  const r = resolveSymbolAt(params);
+  if (!r) return null;
+  // Refuse to rename language keywords and symbols we can't see defined
+  // (Harbour built-ins / stdlib live outside the workspace).
+  if (keywords.indexOf(r.scope.word) >= 0) return null;
+  if (!rename.hasWorkspaceDefinition(files, r.docUri, r.pThis, r.scope))
+    return null;
+  if (r.locations.length === 0) return null;
+  const start = r.doc.positionAt(r.wordOffset);
+  return {
+    range: server.Range.create(
+      start.line,
+      start.character,
+      start.line,
+      start.character + r.wordStr.length,
+    ),
+    placeholder: r.wordStr,
+  };
+});
+
+connection.onRenameRequest((params) => {
+  if (!rename.isValidIdentifier(params.newName))
+    throw new server.ResponseError(
+      server.ErrorCodes.InvalidParams,
+      `'${params.newName}' is not a valid Harbour identifier`,
+    );
+  const r = resolveSymbolAt(params);
+  if (!r) return null;
+  if (keywords.indexOf(r.scope.word) >= 0) return null;
+  if (!rename.hasWorkspaceDefinition(files, r.docUri, r.pThis, r.scope))
+    return null;
+  if (r.locations.length === 0) return null;
+  const changes: Record<string, server.TextEdit[]> = {};
+  for (const loc of r.locations) {
+    (changes[loc.uri] ??= []).push(
+      server.TextEdit.replace(loc.range, params.newName),
+    );
+  }
+  return { changes };
 });
 
 function getNextNotSpace(

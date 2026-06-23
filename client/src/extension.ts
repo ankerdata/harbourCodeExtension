@@ -44,7 +44,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const serverModuleDbg = context.asAbsolutePath(path.join("..", "server"));
   const serverModule = context.asAbsolutePath("server");
-  const debugOptions = { execArgv: ["--nolazy", "--inspect-brk=21780"] };
+  // `--inspect` (not `--inspect-brk`): expose the server for debugging on a
+  // fixed port without *pausing* it on startup. `--inspect-brk` halts the
+  // server on its first line until a debugger attaches to 21780; under F5
+  // (Extension Development Host) nothing attaches automatically, so the
+  // server would freeze and answer no LSP requests.
+  const debugOptions = { execArgv: ["--nolazy", "--inspect=21780"] };
   const serverOptions: ServerOptions = {
     run: { module: serverModule, transport: TransportKind.ipc },
     debug: {
