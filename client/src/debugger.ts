@@ -49,12 +49,18 @@ export class HBVar {
   }
 }
 
+/**
+ * Per-source breakpoint state. Each `[line]` slot holds that breakpoint's wire
+ * command (`"BREAKPOINT\r\n+:src:line"`), or a `"-"`-prefixed tombstone while a
+ * removal is in flight. It is deliberately NOT a place to record ack state —
+ * that lives in `harbourDebugSession.ackedLines`, because overwriting the
+ * command here broke both the worker replay and breakpoint removal (#46).
+ */
 interface BreakpointSource {
   response?: DebugProtocol.SetBreakpointsResponse;
   [line: string]:
     | DebugProtocol.SetBreakpointsResponse
     | string
-    | number
     | undefined;
 }
 
@@ -146,6 +152,30 @@ export class harbourDebugSession extends debugadapter.DebugSession {
   Debugging: boolean = true;
   sourcePaths: string[] = [];
   breakpoints: Record<string, BreakpointSource> = {};
+
+  /**
+   * Lines the runtime has acknowledged, per source (`src` -> set of line keys).
+   *
+   * Ack state used to be recorded by overwriting `breakpoints[src][line]` — the
+   * slot holding the breakpoint's *wire command* — with the number 1. That
+   * silently broke every other reader of that slot, all of which assume it stays
+   * a string: `currentBreakpointsMessage` skipped acked breakpoints, so a worker
+   * thread's replay-on-connect was empty and it never got any breakpoints at all;
+   * and `setBreakPointsRequest`'s tombstone loop skipped them too, so a breakpoint
+   * removed in the editor was never un-set in the runtime and kept firing. Keeping
+   * ack state beside the command, rather than on top of it, fixes both. See #46.
+   */
+  private ackedLines: Map<string, Set<string>> = new Map();
+
+  /** Ack set for `src`, created on first use. */
+  private ackSet(src: string): Set<string> {
+    let set = this.ackedLines.get(src);
+    if (!set) {
+      set = new Set();
+      this.ackedLines.set(src, set);
+    }
+    return set;
+  }
   processId: number | undefined = undefined;
   pathCache: Map<string, string> = new Map();
   processInterval: NodeJS.Timeout | undefined = undefined;
@@ -1576,6 +1606,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
         if (typeof v === "string" && v.substring(0, 1) === "-") {
           messageParts.push("BREAKPOINT\r\n", `-:${src}:${key}\r\n`);
           dest[key] = "-";
+          // Un-ack it: the tombstone is only cleared once the runtime ACKs the
+          // removal (processBreak's idBreak === -1 path), and until then this
+          // source's setBreakpoints response must keep waiting.
+          this.ackSet(src).delete(key);
         }
       }
     }
@@ -1607,8 +1641,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
         (b) => b.line === aLine,
       );
       if (idBreak === -1) {
+        // The runtime ACKed a line we no longer track (typically its ACK of a
+        // removal): drop the tombstone and the ack alike.
         if (String(aLine) in dest) {
           delete dest[String(aLine)];
+          this.ackSet(aInfos[1]).delete(String(aLine));
           this.checkBreakPoint(aInfos[1]);
         }
         return;
@@ -1616,7 +1653,6 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       if (aActual > 1) {
         dest.response.body.breakpoints[idBreak].line = aActual;
         dest.response.body.breakpoints[idBreak].verified = true;
-        dest[String(aLine)] = 1;
       } else {
         dest.response.body.breakpoints[idBreak].verified = false;
         if (aInfos[4] === "notfound") {
@@ -1627,8 +1663,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
           dest.response.body.breakpoints[idBreak].message =
             localize("harbour.dbgNoLine");
         }
-        dest[String(aLine)] = 1;
       }
+      // Record the ack BESIDE the wire command, never on top of it — see
+      // `ackedLines`. Overwriting dest[line] here is what emptied the worker
+      // replay and broke breakpoint removal (#46).
+      this.ackSet(aInfos[1]).add(String(aLine));
       this.checkBreakPoint(aInfos[1]);
     } catch (error) {
       this.sendEvent(
@@ -1642,8 +1681,9 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
   checkBreakPoint(src: string): void {
     const dest = this.breakpoints[src];
+    const acked = this.ackSet(src);
     for (const key of Object.keys(dest)) {
-      if (key !== "response" && dest[key] !== 1) return;
+      if (key !== "response" && !acked.has(key)) return;
     }
     if (dest.response) this.sendResponse(dest.response);
   }

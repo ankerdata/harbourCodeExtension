@@ -52,6 +52,12 @@
 // returns .T. if need step
 static procedure CheckSocket(lStopSent)
    LOCAL tmp, lNeedExit := .F.
+   // .T. only for the CheckSocket call that completed the handshake, so the
+   // line we are parked on gets tested against the breakpoints that arrived
+   // in that same batch. Deliberately a local: as persistent state it could
+   // survive into a later call and re-fire the breakpoint we just resumed
+   // from. See the lNeedExit branch below and #46.
+   LOCAL lJustConnected := .F.
    LOCAL t_oDebugInfo := __DEBUGITEM()
    lStopSent := iif(empty(lStopSent),.F.,lStopSent)
    // if no server then search it.
@@ -80,6 +86,8 @@ static procedure CheckSocket(lStopSent)
       if tmp!="HELLO" //server not found or handshake failed
          t_oDebugInfo['socket'] := nil
          t_oDebugInfo['timeCheckForDebug']+=1
+      else
+         lJustConnected := .T.
       endif
    end do
    if empty(t_oDebugInfo['socket'])
@@ -218,6 +226,25 @@ static procedure CheckSocket(lStopSent)
          endif
       enddo
       if lNeedExit
+         // A thread parks on the first executable line of its function while it
+         // handshakes, and the client sends the breakpoint set followed by GO
+         // while it sits there. Returning here would consume that line without
+         // ever testing it, so a breakpoint on the first executable line could
+         // never fire (#46). This hits main as well as worker threads: main
+         // escapes it only when a LOCAL declaration precedes the breakpoint,
+         // since a LOCAL is itself a stop line and main parks on that instead.
+         if lJustConnected
+            lJustConnected := .F.
+            if t_oDebugInfo['lRunning'] .and. inBreakpoint()
+               t_oDebugInfo['lRunning'] := .F.
+               lNeedExit := .F.
+               if .not. lStopSent
+                  hb_inetSend(t_oDebugInfo['socket'],"STOP:break"+CRLF)
+                  lStopSent := .T.
+               endif
+               loop
+            endif
+         endif
          return
       endif
       if t_oDebugInfo['lRunning']
@@ -867,6 +894,17 @@ static procedure setBreakpoint(cInfo)
    if idLine=0
       aAdd(t_oDebugInfo['aBreaks'][aInfos[2]],{nLine})
       idLine = len(t_oDebugInfo['aBreaks'][aInfos[2]])
+   else
+      // Re-setting a line REPLACES its condition / hit-count / logpoint extras;
+      // it must not append to them. The client re-sends "+" for a line whenever
+      // its breakpoint changes (that is how a condition is edited, or cleared),
+      // and inBreakpoint() requires EVERY '?' extra to hold. Appending therefore
+      // left the old condition in force: edit "a" to "b" and the breakpoint can
+      // never fire again, because both must be true at once; clear a condition
+      // and the breakpoint stays silently conditional. Truncating to {nLine}
+      // drops the stale extras (and resets hit counters, which is what a
+      // re-set should do anyway). See #47.
+      aSize(t_oDebugInfo['aBreaks'][aInfos[2]][idLine], 1)
    endif
    nExtra := 4
    do While len(aInfos) >= nExtra

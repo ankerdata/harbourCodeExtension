@@ -1414,6 +1414,111 @@ describe("Phase 6: per-thread breakpoint state replay (#34)", () => {
     expect(bpIdx).toBeLessThan(goIdx);
   });
 
+  /**
+   * The test above sets breakpoints but never lets the runtime ACK them, which
+   * is not what happens in a real session: main ACKs within milliseconds of
+   * launch, long before any worker spawns. Ack state used to be recorded by
+   * overwriting breakpoints[src][line] — the slot holding the wire command —
+   * with the number 1, and currentBreakpointsMessage() only emits strings. So
+   * in every real session the replay was EMPTY and workers got no breakpoints
+   * at all, while the test above happily passed. Pin the realistic ordering.
+   */
+  it("acceptThreadSocket replays breakpoints to a worker even after main has ACKed them", () => {
+    const { session } = makeSession();
+    const fakeServer = {} as unknown as import("net").Server;
+    const accept = (
+      session as unknown as {
+        acceptThreadSocket: (s: unknown, srv: unknown) => void;
+      }
+    ).acceptThreadSocket.bind(session);
+
+    const main = new FakeSocket();
+    accept(main, fakeServer);
+    main.written.length = 0;
+
+    (
+      session as unknown as {
+        setBreakPointsRequest: (
+          r: DebugProtocol.SetBreakpointsResponse,
+          a: DebugProtocol.SetBreakpointsArguments,
+        ) => void;
+      }
+    ).setBreakPointsRequest(
+      {
+        type: "response",
+        request_seq: 1,
+        success: true,
+        command: "setBreakpoints",
+        seq: 0,
+        body: { breakpoints: [] },
+      },
+      {
+        source: { name: "test.prg", path: "test.prg" },
+        breakpoints: [{ line: 42 }, { line: 99 }],
+      },
+    );
+
+    // The Harbour runtime (main thread) ACKs both breakpoints.
+    const processBreak = (
+      session as unknown as { processBreak: (l: string) => void }
+    ).processBreak.bind(session);
+    processBreak("BREAK:test.prg:42:42");
+    processBreak("BREAK:test.prg:99:99");
+
+    // Only now does the worker spawn and connect.
+    const worker = new FakeSocket();
+    accept(worker, fakeServer);
+    const wire = worker.written.join("");
+
+    expect(wire).toContain("BREAKPOINT\r\n+:test.prg:42");
+    expect(wire).toContain("BREAKPOINT\r\n+:test.prg:99");
+    expect(wire.indexOf("BREAKPOINT\r\n")).toBeLessThan(wire.indexOf("GO\r\n"));
+  });
+
+  it("broadcasts the un-set of an ACKed breakpoint to every live thread", () => {
+    // Same root cause as the replay bug: the tombstone loop in
+    // setBreakPointsRequest only marks string-valued slots, so once the ack
+    // had overwritten the slot with 1 the `-:` command was never sent and a
+    // breakpoint deleted in the editor kept firing in the runtime.
+    const { session, main, worker } = setupTwoLiveThreads();
+    const setBps = (
+      session as unknown as {
+        setBreakPointsRequest: (
+          r: DebugProtocol.SetBreakpointsResponse,
+          a: DebugProtocol.SetBreakpointsArguments,
+        ) => void;
+      }
+    ).setBreakPointsRequest.bind(session);
+    const response = (): DebugProtocol.SetBreakpointsResponse => ({
+      type: "response",
+      request_seq: 1,
+      success: true,
+      command: "setBreakpoints",
+      seq: 0,
+      body: { breakpoints: [] },
+    });
+
+    setBps(response(), {
+      source: { name: "test.prg", path: "test.prg" },
+      breakpoints: [{ line: 42 }],
+    });
+    (
+      session as unknown as { processBreak: (l: string) => void }
+    ).processBreak("BREAK:test.prg:42:42");
+
+    main.written.length = 0;
+    worker.written.length = 0;
+
+    // User deletes the breakpoint in the editor.
+    setBps(response(), {
+      source: { name: "test.prg", path: "test.prg" },
+      breakpoints: [],
+    });
+
+    expect(main.written.join("")).toContain("BREAKPOINT\r\n-:test.prg:42");
+    expect(worker.written.join("")).toContain("BREAKPOINT\r\n-:test.prg:42");
+  });
+
   it("acceptThreadSocket on a worker sends NO ERRORTYPE replay if the client never set it", () => {
     // Don't send setExceptionBreakpoints. New worker should not get a
     // synthetic ERRORTYPE (currentErrorType is null).
