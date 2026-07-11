@@ -894,6 +894,17 @@ static procedure setBreakpoint(cInfo)
    if idLine=0
       aAdd(t_oDebugInfo['aBreaks'][aInfos[2]],{nLine})
       idLine = len(t_oDebugInfo['aBreaks'][aInfos[2]])
+   else
+      // Re-setting a line REPLACES its condition / hit-count / logpoint extras;
+      // it must not append to them. The client re-sends "+" for a line whenever
+      // its breakpoint changes (that is how a condition is edited, or cleared),
+      // and inBreakpoint() requires EVERY '?' extra to hold. Appending therefore
+      // left the old condition in force: edit "a" to "b" and the breakpoint can
+      // never fire again, because both must be true at once; clear a condition
+      // and the breakpoint stays silently conditional. Truncating to {nLine}
+      // drops the stale extras (and resets hit counters, which is what a
+      // re-set should do anyway). See #47.
+      aSize(t_oDebugInfo['aBreaks'][aInfos[2]][idLine], 1)
    endif
    nExtra := 4
    do While len(aInfos) >= nExtra
