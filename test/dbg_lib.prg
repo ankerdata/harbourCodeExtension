@@ -47,7 +47,76 @@
 #define HB_DBG_VAR_LEN           4
 #endif
 
+/* hb_inetErrorCode() result codes. Harbour declares these in the C header
+   hbznet.h, which is not reachable from PRG, so mirror them here. */
+#ifndef HB_INET_ERR_OK
+#define HB_INET_ERR_OK            0
+#define HB_INET_ERR_TIMEOUT     ( -1 )
+#define HB_INET_ERR_CLOSEDCONN  ( -2 )
+#define HB_INET_ERR_BUFFOVERRUN ( -3 )
+#define HB_INET_ERR_CLOSEDSOCKET ( -4 )
+#endif
+
+/* Max 0.2s polls to wait for the client's handshake reply before giving up
+   and retrying the connection (10s - generous for a loopback connection). */
+#ifndef HANDSHAKE_MAX_TRIES
+#define HANDSHAKE_MAX_TRIES 50
+#endif
+
 #define CRLF e"\r\n"
+
+/* Heartbeats a single thread may write before it stops ticking. The cap is on
+   heartbeats alone - events (connect, teardown, disconnect) are always logged,
+   however late they happen. A shared budget is worse than useless: heartbeats
+   exhaust it in the first seconds and the teardown you were looking for is the
+   line that gets dropped. */
+#ifndef DBG_SOCKLOG_MAX
+#define DBG_SOCKLOG_MAX 500
+#endif
+
+/* Source lines between heartbeats. Deliberately small: the threads worth
+   watching are short-lived GUI ones that never execute enough lines to tick at
+   a coarse interval, and pinning the moment a thread stops running is the whole
+   point. Long-running threads simply exhaust DBG_SOCKLOG_MAX and fall silent -
+   events keep being logged either way. */
+#ifndef DBG_SOCKLOG_TICK
+#define DBG_SOCKLOG_TICK 100
+#endif
+
+/* Per-thread socket diagnostics, off unless the environment variable
+   HB_DBG_SOCKLOG is set - a runtime switch rather than a compile-time one so
+   turning it on costs a rebuild of nothing. Writes DBGSOCK_<hb_threadID()>.LOG
+   beside the executable: one file per thread, never a shared one, because
+   fSeek(FS_END)+fWrite is not atomic and two threads sharing a FO_DENYNONE
+   handle seek to the same offset and one silently overwrites the other. */
+static procedure SockLog( cMsg, lHeartbeat )
+   THREAD STATIC t_nBeats := 0
+   THREAD STATIC t_hLog := -1
+   THREAD STATIC t_lOn := nil
+   if t_lOn == nil
+      t_lOn := .not. empty(GetEnv("HB_DBG_SOCKLOG"))
+   endif
+   if .not. t_lOn
+      return
+   endif
+   if lHeartbeat == .T.
+      if t_nBeats >= DBG_SOCKLOG_MAX
+         return
+      endif
+      t_nBeats++
+   endif
+   if t_hLog == -1
+      t_hLog := fCreate(hb_DirBase() + "DBGSOCK_" + ;
+                        alltrim(str(hb_threadID())) + ".LOG")
+   endif
+   if t_hLog >= 0
+      // seconds() rather than time(): correlating a thread with the client's
+      // accept order needs better than one-second resolution - six threads
+      // connect inside 150ms.
+      fWrite(t_hLog, alltrim(str(seconds(),12,3)) + " " + procName(1) + "(" + ;
+             alltrim(str(procLine(1))) + ") " + cMsg + CRLF)
+   endif
+return
 
 // returns .T. if need step
 static procedure CheckSocket(lStopSent)
@@ -58,8 +127,17 @@ static procedure CheckSocket(lStopSent)
    // survive into a later call and re-fire the breakpoint we just resumed
    // from. See the lNeedExit branch below and #46.
    LOCAL lJustConnected := .F.
+   LOCAL nSockError, nReady, nWaitTries
    LOCAL t_oDebugInfo := __DEBUGITEM()
+   // Heartbeat counter for SockLog: a healthy connected thread is otherwise
+   // silent, so "the log stops" would not distinguish a thread that exited
+   // from one that is running fine.
+   THREAD STATIC t_nTick := 0
    lStopSent := iif(empty(lStopSent),.F.,lStopSent)
+   if ++t_nTick % DBG_SOCKLOG_TICK == 0
+      SockLog("ALIVE lines=" + alltrim(str(t_nTick)) + ;
+              " connected=" + iif(empty(t_oDebugInfo['socket']),"N","Y"), .T.)
+   endif
    // if no server then search it.
    // 140+130+120+110+100+90+80+70+60+50+40+30+20+10=1050 wait 1sec at start, then 0
    do while (empty(t_oDebugInfo['socket']) .and. t_oDebugInfo['timeCheckForDebug']<=14)
@@ -76,29 +154,59 @@ static procedure CheckSocket(lStopSent)
 #else
          hb_inetSend(t_oDebugInfo['socket'],HB_ARGV(0)+CRLF+str(__PIDNum())+CRLF)
 #endif
-         do while hb_inetDataReady(t_oDebugInfo['socket']) != 1 //waiting for response
+         // Wait for the handshake reply. hb_inetDataReady() returns 0 for "no
+         // data yet", 1 for "data ready" and -1 on a socket error; -1 can never
+         // become 1, so the wait is bounded and any non-1 result is a failed
+         // handshake, handled by the retry path below.
+         nWaitTries := 0
+         nReady := hb_inetDataReady(t_oDebugInfo['socket'])
+         do while nReady == 0 .and. nWaitTries < HANDSHAKE_MAX_TRIES
             hb_idleSleep(0.2)
+            nWaitTries++
+            nReady := hb_inetDataReady(t_oDebugInfo['socket'])
          end do
-         tmp := hb_inetRecvLine(t_oDebugInfo['socket']) // if the server does not respond "NO" it is ok
-         ? "connected, returned ",tmp
+         if nReady != 1
+            tmp := "NO"
+         else
+            tmp := hb_inetRecvLine(t_oDebugInfo['socket']) // if the server does not respond "NO" it is ok
+            ? "connected, returned ",tmp
+         endif
          // End of handshake
       endif
       if tmp!="HELLO" //server not found or handshake failed
+         SockLog("CONNECT-FAIL reply=" + hb_valToExp(tmp))
          t_oDebugInfo['socket'] := nil
          t_oDebugInfo['timeCheckForDebug']+=1
       else
+         SockLog("CONNECTED")
          lJustConnected := .T.
       endif
    end do
    if empty(t_oDebugInfo['socket'])
-      // no debug server
+      // no debug server. Logged per source line: a run of these after a
+      // TEARDOWN is the proof that the thread is still executing and it was
+      // only the socket that went away.
+      // shares the heartbeat budget: this one fires on every source line
+      SockLog("NO-SERVER retry=" + ;
+              alltrim(str(t_oDebugInfo['timeCheckForDebug'])), .T.)
       t_oDebugInfo['timeCheckForDebug']-=1
       return
    endif
    do while .T.
-      if empty(t_oDebugInfo['socket']) .or. hb_inetErrorCode(t_oDebugInfo['socket']) <> 0
-         // disconected?
-         //? ("socket error",hb_inetErrorDesc( t_oDebugInfo['socket'] ))
+      // Only a lost connection is a disconnect, and it has to be named
+      // explicitly: hb_inetErrorCode() also reports plain socket timeouts and
+      // raw OS/WSA codes (WSAEWOULDBLOCK, WSAEINTR and friends), none of which
+      // mean the peer has gone. Treating "anything that is not OK" as a
+      // disconnect drops the socket out from under a thread that is still
+      // running perfectly well - it then reconnects on a later source line and
+      // the client reports a thread that never exited. See #50.
+      nSockError := iif(empty(t_oDebugInfo['socket']), HB_INET_ERR_OK, ;
+                        hb_inetErrorCode(t_oDebugInfo['socket']))
+      if empty(t_oDebugInfo['socket']) .or. ;
+            nSockError == HB_INET_ERR_CLOSEDCONN .or. ;
+            nSockError == HB_INET_ERR_CLOSEDSOCKET .or. ;
+            nSockError == HB_INET_ERR_BUFFOVERRUN
+         SockLog("TEARDOWN err=" + alltrim(str(nSockError)))
          t_oDebugInfo['socket'] := nil
          t_oDebugInfo['lRunning'] := .T.
          t_oDebugInfo['aBreaks'] := {=>}
@@ -213,6 +321,7 @@ static procedure CheckSocket(lStopSent)
                   sendCompletition(hb_inetRecvLine(t_oDebugInfo['socket']))
                   END_COM
                COMMAND "DISCONNECT"
+                  SockLog("DISCONNECT from client")
                   t_oDebugInfo['socket'] := nil
                   t_oDebugInfo['lRunning'] := .T.
                   t_oDebugInfo['aBreaks'] := {=>}
@@ -1304,23 +1413,31 @@ STATIC PROCEDURE SetErrorType( nType )
    __DEBUGITEM(t_oDebugInfo)
 return
 
-STATIC PROCEDURE ErrorBlockCode( e )
+// The value an error block returns is the recovery value: for a retryable or
+// substitutable error the runtime resumes with it, and for the rest the app's
+// own handler decides what happens next. This wrapper stands in for the app's
+// error block while debugging, so it has to be a FUNCTION and hand that value
+// straight back - swallowing it turns an error the app handles into an
+// unhandled one. In a worker thread that quits the thread (the process itself
+// survives), so the connection drops and the debugger reports a thread that
+// only died because it was being debugged. See #50.
+STATIC FUNCTION ErrorBlockCode( e )
    LOCAL t_oDebugInfo := __DEBUGITEM()
    if t_oDebugInfo["inError"]
-      return
+      return nil
    endif
    //? "error with ",t_oDebugInfo["errorType"]
    if t_oDebugInfo["errorType"]==0 // 0 is no stop on error
       if !empty(t_oDebugInfo['userErrorBlock'])
-         eval(t_oDebugInfo['userErrorBlock'], e)
+         return eval(t_oDebugInfo['userErrorBlock'], e)
       endif
-      return
+      return nil
    endif
    if t_oDebugInfo["errorType"]==1 .and. IsBegSeq() // 1 is no stop on error in sequence
       if !empty(t_oDebugInfo['userErrorBlock'])
-         eval(t_oDebugInfo['userErrorBlock'], e)
+         return eval(t_oDebugInfo['userErrorBlock'], e)
       endif
-      return
+      return nil
    endif
    t_oDebugInfo['__dbgEntryLevel'] := __dbgProcLevel()
    if !empty(t_oDebugInfo['socket'])
@@ -1334,9 +1451,9 @@ STATIC PROCEDURE ErrorBlockCode( e )
    endif
    t_oDebugInfo := __DEBUGITEM()
    if !empty(t_oDebugInfo['userErrorBlock'])
-      eval(t_oDebugInfo['userErrorBlock'], e)
+      return eval(t_oDebugInfo['userErrorBlock'], e)
    endif
-return
+return nil
 
 #ifdef INAPACHE
 static function GetAppName()

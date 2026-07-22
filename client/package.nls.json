@@ -22,6 +22,8 @@
   "harbour.launch.sourcePaths": "Directories where search for source files",
   "harbour.launch.terminalType": "Type of terminal to use to run the application",
   "harbour.launch.port": "Port used by debugger, It must be the same value of DBG_PORT in debugger code line 6",
+  "harbour.launch.env": "Environment variables to add to the debugged program's environment",
+  "harbour.launch.trace": "Write a diagnostic log of the debug session to harbour-dbg-crash-<pid>.log in the system temp directory",
   "harbour.dbgError1": "Unable to start {0} in {1}, check that all path exists",
   "harbour.prematureExit": "Exit early with code {0}",
   "harbour.dbgNoModule": "Module not found",

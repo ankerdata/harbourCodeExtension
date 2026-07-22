@@ -83,6 +83,13 @@ type LaunchArgs = DebugProtocol.LaunchRequestArguments & {
   program?: string;
   workingDir?: string;
   arguments?: string[];
+  /**
+   * Extra environment for the debuggee, merged over the adapter's own. The
+   * adapter inherits its environment from an extension host that is usually
+   * already running, so a variable exported in a shell afterwards never
+   * reaches the program — this is the only route that does.
+   */
+  env?: Record<string, string>;
 };
 
 type AttachArgs = DebugProtocol.AttachRequestArguments & {
@@ -148,6 +155,13 @@ export class ThreadState {
 
 export const MAIN_THREAD_ID = 1;
 
+/**
+ * Cap on how many bytes may accumulate while waiting for a complete handshake.
+ * A peer that connects and never sends two CRLF-terminated lines is rejected
+ * rather than buffered indefinitely. The real handshake is a path plus a pid.
+ */
+const MAX_HANDSHAKE_BYTES = 4096;
+
 export class harbourDebugSession extends debugadapter.DebugSession {
   Debugging: boolean = true;
   sourcePaths: string[] = [];
@@ -197,6 +211,16 @@ export class harbourDebugSession extends debugadapter.DebugSession {
 
   /** Allocator for non-main thread ids (assigned as new harbour threads connect). */
   private nextThreadId: number = MAIN_THREAD_ID + 1;
+
+  /**
+   * Whether the main-thread slot has been claimed. Sticky for the life of the
+   * session: `mainThread.socket` goes null again when that socket closes, so
+   * testing it would let the next connection be adopted as main. A connection
+   * arriving after main's socket dropped is a *new* harbour thread and must get
+   * its own id, the state replay and the auto-GO — as main it gets none of them
+   * and the runtime thread parks in CheckSocket forever waiting for a command.
+   */
+  private mainBound: boolean = false;
 
   /**
    * Global frameId / variablesReference registries. These IDs are the opaque
@@ -591,6 +615,7 @@ export class harbourDebugSession extends debugadapter.DebugSession {
             kind: args.terminalType,
             cwd: args.workingDir ?? "",
             args: [args.program ?? ""].concat(args.arguments ?? []),
+            env: args.env,
           },
           /*timeout*/ 0,
           (runResp) => {
@@ -603,9 +628,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       case "none":
       default: {
         if (!args.program) break;
-        const childProcess = args.arguments
-          ? cp.spawn(args.program, args.arguments, { cwd: args.workingDir })
-          : cp.spawn(args.program, { cwd: args.workingDir });
+        const childProcess = cp.spawn(args.program, args.arguments ?? [], {
+          cwd: args.workingDir,
+          env: args.env ? { ...process.env, ...args.env } : undefined,
+        });
         childProcess.on("error", (_e) => {
           tc.sendEvent(
             new debugadapter.OutputEvent(
@@ -753,25 +779,59 @@ export class harbourDebugSession extends debugadapter.DebugSession {
     args: LaunchArgs | AttachArgs,
   ): void {
     const tc = this;
+    let buffer = "";
+    let settled = false;
+
+    // Turn the connection away. `end()` is only a half-close — the readable
+    // side stays open — so the data listener has to go with it: otherwise a
+    // later fragment re-enters this handler and can hand the adapter a socket
+    // it has already closed, which then reports a live thread as exited (#50).
+    const reject = (why: string): void => {
+      diagnosticLog?.(
+        "handshake-reject",
+        `${why} peer=${socket.remoteAddress}:${socket.remotePort} buffer="${buffer.replace(/\r?\n/g, "\\n").slice(0, 120)}"`,
+      );
+      settled = true;
+      socket.removeAllListeners("data");
+      socket.write("NO\r\n");
+      socket.end();
+    };
 
     // Per-socket handshake handler. The handshake is exactly two CRLF-terminated
-    // lines: <exeName>\r\n<pid>\r\n. After the handshake validates, the socket
-    // is bound to a ThreadState and its data handler is swapped to processInput.
-    // Each new connection gets its own ThreadState; the first connection becomes
-    // the main thread, subsequent connections emit ThreadEvent('started').
+    // lines: <exeName>\r\n<pid>\r\n, written by dbg_lib as a single hb_inetSend.
+    // TCP is a byte stream and gives no guarantee that both lines land in one
+    // `data` event, so bytes accumulate here until the second CRLF arrives.
+    // After the handshake validates, the socket is bound to a ThreadState and
+    // its data handler is swapped to processInput. Each new connection gets its
+    // own ThreadState; the first connection becomes the main thread, subsequent
+    // connections emit ThreadEvent('started').
     socket.on("data", (data) => {
+      if (settled) return;
+      buffer += data.toString();
+      if (buffer.length > MAX_HANDSHAKE_BYTES) {
+        reject("oversize");
+        return;
+      }
+
+      let processId: number;
+      let rest: string;
+      let exeName: string;
       try {
-        const lines = data.toString().split("\r\n");
-        if (lines.length < 2) {
-          socket.write("NO\r\n");
-          socket.end();
+        const eol1 = buffer.indexOf("\r\n");
+        if (eol1 < 0) return;
+        const eol2 = buffer.indexOf("\r\n", eol1 + 2);
+        if (eol2 < 0) return;
+        exeName = buffer.slice(0, eol1);
+        rest = buffer.slice(eol2 + 2);
+
+        processId = parseInt(buffer.slice(eol1 + 2, eol2));
+        if (!Number.isInteger(processId)) {
+          reject("non-numeric-pid");
           return;
         }
-        const processId = parseInt(lines[1]);
         if (tc.processId) {
           if (tc.processId !== processId) {
-            socket.write("NO\r\n");
-            socket.end();
+            reject(`pid-mismatch want=${tc.processId} got=${processId}`);
             return;
           }
         } else {
@@ -780,11 +840,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
               .basename(args.program, path.extname(args.program))
               .toLowerCase();
             const clPath = path
-              .basename(lines[0], path.extname(lines[0]))
+              .basename(exeName, path.extname(exeName))
               .toLowerCase();
             if (clPath !== exeTarget) {
-              socket.write("NO\r\n");
-              socket.end();
+              reject(`program-mismatch want=${exeTarget} got=${clPath}`);
               return;
             }
           }
@@ -794,19 +853,31 @@ export class harbourDebugSession extends debugadapter.DebugSession {
             attachProcess > 0 &&
             attachProcess !== processId
           ) {
-            socket.write("NO\r\n");
-            socket.end();
+            reject("attach-pid-mismatch");
             return;
           }
         }
-
-        socket.write("HELLO\r\n");
-        tc.setProcess(processId);
-        tc.acceptThreadSocket(socket, server);
-      } catch (_ex) {
-        socket.write("NO\r\n");
-        socket.end();
+      } catch (ex) {
+        reject(`parse-error ${(ex as Error).message}`);
+        return;
       }
+
+      settled = true;
+      diagnosticLog?.(
+        "handshake-ok",
+        `peer=${socket.remoteAddress}:${socket.remotePort} pid=${processId} exe="${exeName}" handshakeBytes=${buffer.length - rest.length} rest=${rest.length}`,
+      );
+      socket.removeAllListeners("data");
+      socket.write("HELLO\r\n");
+      tc.setProcess(processId);
+      // Outside the try above: a throw in here means the socket is already
+      // bound to a live thread, and rejecting it would close a working
+      // connection rather than report the failure.
+      tc.acceptThreadSocket(socket, server);
+      // dbg_lib can pipeline its first command into the handshake packet.
+      // Hand anything past the second CRLF to the handler acceptThreadSocket
+      // just installed instead of dropping it.
+      if (rest.length > 0) socket.emit("data", Buffer.from(rest));
     });
   }
 
@@ -818,9 +889,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
    */
   private acceptThreadSocket(socket: net.Socket, server: net.Server): void {
     const tc = this;
-    const isFirst = !this.mainThread.socket;
+    const isFirst = !this.mainBound;
     let thread: ThreadState;
     if (isFirst) {
+      this.mainBound = true;
       thread = this.mainThread;
       thread.socket = socket;
       this.sendEvent(new debugadapter.InitializedEvent());
@@ -836,6 +908,11 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       this.threads.set(tid, thread);
       this.sendEvent(new debugadapter.ThreadEvent("started", tid));
     }
+
+    // Captured now: remoteAddress/remotePort read as undefined once the socket
+    // is destroyed, which is exactly when the close/end handlers below run.
+    const peer = `${socket.remoteAddress}:${socket.remotePort}`;
+    diagnosticLog?.("thread-accept", `thread=${thread.id} isFirst=${isFirst} peer=${peer}`);
 
     socket.removeAllListeners("data");
     socket.on("data", (data2) => {
@@ -859,6 +936,10 @@ export class harbourDebugSession extends debugadapter.DebugSession {
       }
     });
     socket.on("error", (error) => {
+      diagnosticLog?.(
+        "socket-error",
+        `thread=${thread.id} err=${(error as NodeJS.ErrnoException).code ?? ""} ${error.message}`,
+      );
       tc.sendEvent(
         new debugadapter.OutputEvent(
           `Socket error (thread ${thread.id}): ${error.message}\r\n`,
@@ -866,7 +947,21 @@ export class harbourDebugSession extends debugadapter.DebugSession {
         ),
       );
     });
-    socket.on("close", () => {
+    // 'end' means the *peer* sent FIN — the Harbour side closed the connection
+    // (or the thread owning it went away). 'close' with no preceding 'end' means
+    // the close came from this side. The distinction is the only reliable way to
+    // tell a genuinely exiting Harbour thread from an adapter-side teardown.
+    socket.on("end", () => {
+      diagnosticLog?.(
+        "socket-end",
+        `thread=${thread.id} peer=${peer} sent FIN, read=${socket.bytesRead} written=${socket.bytesWritten}`,
+      );
+    });
+    socket.on("close", (hadError: boolean) => {
+      diagnosticLog?.(
+        "socket-close",
+        `thread=${thread.id} peer=${peer} hadError=${hadError} read=${socket.bytesRead} written=${socket.bytesWritten}`,
+      );
       thread.socket = null;
       if (thread.id !== MAIN_THREAD_ID) {
         tc.threads.delete(thread.id);
