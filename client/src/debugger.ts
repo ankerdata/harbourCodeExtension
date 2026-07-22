@@ -19,6 +19,13 @@ interface WinMonitor {
   stop(): void;
 }
 
+/**
+ * OutputDebugString monitoring, when the native addon is available. It is an
+ * `optionalDependency` that compiles via node-gyp, so it is absent whenever a
+ * host lacks a usable MSVC toolchain — including every non-Windows machine and
+ * the Linux runner that builds the released VSIX. Absence is normal and costs
+ * only this feature, so the require stays guarded and every call site uses `?.`.
+ */
 let winMonitor: WinMonitor | undefined;
 if (platform === "win32") {
   try {
