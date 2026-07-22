@@ -26,9 +26,22 @@ class HarbourDebugAdapterDescriptorFactory
 {
   constructor(private readonly extensionPath: string) {}
 
-  createDebugAdapterDescriptor(): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
+  createDebugAdapterDescriptor(
+    session: vscode.DebugSession,
+  ): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
     const program = path.join(this.extensionPath, "dist", "debugger.js");
-    return new vscode.DebugAdapterExecutable(process.execPath, [program]);
+    // `"trace": true` in launch.json turns on the adapter's diagnostic log
+    // (%TEMP%/harbour-dbg-crash-<pid>.log). Setting HARBOUR_DBG_TRACE in the
+    // shell only works if that shell started VS Code — an already-running
+    // instance never sees it — so the launch config is the reliable switch.
+    const options = session.configuration.trace
+      ? { env: { ...process.env, HARBOUR_DBG_TRACE: "1" } }
+      : undefined;
+    return new vscode.DebugAdapterExecutable(
+      process.execPath,
+      [program],
+      options,
+    );
   }
 }
 
