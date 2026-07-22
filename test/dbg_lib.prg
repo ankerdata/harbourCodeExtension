@@ -47,6 +47,22 @@
 #define HB_DBG_VAR_LEN           4
 #endif
 
+/* hb_inetErrorCode() result codes. Harbour declares these in the C header
+   hbznet.h, which is not reachable from PRG, so mirror them here. */
+#ifndef HB_INET_ERR_OK
+#define HB_INET_ERR_OK            0
+#define HB_INET_ERR_TIMEOUT     ( -1 )
+#define HB_INET_ERR_CLOSEDCONN  ( -2 )
+#define HB_INET_ERR_BUFFOVERRUN ( -3 )
+#define HB_INET_ERR_CLOSEDSOCKET ( -4 )
+#endif
+
+/* Max 0.2s polls to wait for the client's handshake reply before giving up
+   and retrying the connection (10s - generous for a loopback connection). */
+#ifndef HANDSHAKE_MAX_TRIES
+#define HANDSHAKE_MAX_TRIES 50
+#endif
+
 #define CRLF e"\r\n"
 
 // returns .T. if need step
@@ -58,6 +74,7 @@ static procedure CheckSocket(lStopSent)
    // survive into a later call and re-fire the breakpoint we just resumed
    // from. See the lNeedExit branch below and #46.
    LOCAL lJustConnected := .F.
+   LOCAL nSockError, nReady, nWaitTries
    LOCAL t_oDebugInfo := __DEBUGITEM()
    lStopSent := iif(empty(lStopSent),.F.,lStopSent)
    // if no server then search it.
@@ -76,11 +93,23 @@ static procedure CheckSocket(lStopSent)
 #else
          hb_inetSend(t_oDebugInfo['socket'],HB_ARGV(0)+CRLF+str(__PIDNum())+CRLF)
 #endif
-         do while hb_inetDataReady(t_oDebugInfo['socket']) != 1 //waiting for response
+         // Wait for the handshake reply. hb_inetDataReady() returns 0 for "no
+         // data yet", 1 for "data ready" and -1 on a socket error; -1 can never
+         // become 1, so the wait is bounded and any non-1 result is a failed
+         // handshake, handled by the retry path below.
+         nWaitTries := 0
+         nReady := hb_inetDataReady(t_oDebugInfo['socket'])
+         do while nReady == 0 .and. nWaitTries < HANDSHAKE_MAX_TRIES
             hb_idleSleep(0.2)
+            nWaitTries++
+            nReady := hb_inetDataReady(t_oDebugInfo['socket'])
          end do
-         tmp := hb_inetRecvLine(t_oDebugInfo['socket']) // if the server does not respond "NO" it is ok
-         ? "connected, returned ",tmp
+         if nReady != 1
+            tmp := "NO"
+         else
+            tmp := hb_inetRecvLine(t_oDebugInfo['socket']) // if the server does not respond "NO" it is ok
+            ? "connected, returned ",tmp
+         endif
          // End of handshake
       endif
       if tmp!="HELLO" //server not found or handshake failed
@@ -96,7 +125,15 @@ static procedure CheckSocket(lStopSent)
       return
    endif
    do while .T.
-      if empty(t_oDebugInfo['socket']) .or. hb_inetErrorCode(t_oDebugInfo['socket']) <> 0
+      // Only a genuine error (CLOSEDCONN / CLOSEDSOCKET / BUFFOVERRUN) is a
+      // disconnect. HB_INET_ERR_TIMEOUT is the normal idle result of the
+      // hb_inetDataReady() drain loop below - the socket carries the <=140ms
+      // timeout given to hb_inetCreate() above, so any thread with no pending
+      // command reports it on every poll.
+      nSockError := iif(empty(t_oDebugInfo['socket']), HB_INET_ERR_OK, ;
+                        hb_inetErrorCode(t_oDebugInfo['socket']))
+      if empty(t_oDebugInfo['socket']) .or. ;
+            (nSockError != HB_INET_ERR_OK .and. nSockError != HB_INET_ERR_TIMEOUT)
          // disconected?
          //? ("socket error",hb_inetErrorDesc( t_oDebugInfo['socket'] ))
          t_oDebugInfo['socket'] := nil
