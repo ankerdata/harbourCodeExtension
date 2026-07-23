@@ -10,14 +10,11 @@
     "url": "https://github.com/ankerdata/harbourCodeExtension"
   },
   "activationEvents": [
-    "onLanguage:harbour",
-    "onCommand:harbour.getdbgcode",
-    "onCommand:harbour.setupCodeFormat",
     "workspaceContains:**/*.prg",
     "onDebugResolve:harbour-dbg"
   ],
   "engines": {
-    "vscode": "^1.40.0"
+    "vscode": "^1.125.0"
   },
   "categories": [
     "Programming Languages",
@@ -584,7 +581,7 @@
   "devDependencies": {
     "@types/jest": "^29.5.12",
     "@types/node": "^18.8.4",
-    "@types/vscode": "^1.40.0",
+    "@types/vscode": "~1.125.0",
     "@vscode/vsce": "^3.9.1",
     "esbuild": "^0.24.0",
     "jest": "^29.7.0",
