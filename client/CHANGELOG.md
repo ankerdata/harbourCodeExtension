@@ -1,6 +1,12 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.4.3
+ - **Language server** fixed `alias->field` completion going silent for a database once one of its fields shares the alias's own name. `findDBReferences` guarded against re-recording a field by testing `fields[dbCmd]` — the *alias* name — instead of `fields[cmpName]`, the field being added. Normally the alias never matches a field name, the guard is always false and every field is recorded, which is why this went unnoticed. But a reference like `ord->ord` puts a key named `ord` into that database's field map, the guard turns true from then on, and **every subsequent field of that alias is dropped from the index**. Confirmed against a live server: with `ord->ord`, `ord->total` and `ord->status` in one file, completion after `ord->` offered only `ord`; it now offers all three. Closes #17.
+
+   The guard's other effect was inverted too — because it never fired, a field seen twice in different casing kept the *last* casing rather than the first. It now keeps the first, which is what a "don't re-record" check is for.
+ - **Tests** two tests over a new `dbFieldClash.prg` fixture: fields keep being indexed past one matching the alias name, and a repeated field keeps its first-seen casing. Both fail against the previous code.
+
 # 1.4.2
  - **Localization** `vscode-nls`, which is in maintenance mode, replaced by `@vscode/l10n`. It was only ever doing the `{0}` placeholder substitution here — the message lookup was already hand-rolled against `package.nls*.json` — so `@vscode/l10n.t()` drops straight into its place. Closes #11.
 
