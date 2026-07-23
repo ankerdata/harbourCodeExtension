@@ -1,6 +1,17 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.4.4
+ - **Build** development dependencies brought up to date: `jest` and `@types/jest` 29 → 30, `esbuild` 0.24 → 0.28, `@vscode/codicons` 0.0.32 → 0.0.45, `@types/node` 18 → 20. `ts-jest` and `@vscode/vsce` needed no manifest change — their existing ranges already covered the newer releases, which is what CI resolves anyway. Closes #20.
+
+   The runtime dependencies the issue named were already current: `vscode-uri` (3.1.0) and `vscode-languageserver-textdocument` (1.0.12) are at their newest published versions, their caret ranges having kept pace on their own.
+
+   `@types/node` is pinned to the 20 line rather than the current 26 deliberately. Types describe what the code may call, and both CI and the VS Code extension host run Node 20 — typing against 26 would let code compile against APIs that are absent where it actually runs.
+
+   `npm-check-updates` removed from the server's dev dependencies. Nothing referenced it — no script, no documentation — and `npx npm-check-updates` works without it being installed.
+ - **Build** `true-case-path` stays at 2.2.1 with its local type shim. It is still the newest published version and still ships no types, so the shim in `server/src/types/` cannot be retired yet; swapping the library across its nine call sites to delete three lines is not a good trade.
+ - **Build** TypeScript stays on 6.0.3, already the newest 6.x. TypeScript 7 type-checks this codebase cleanly, but it ships as a native binary with no JavaScript compiler API — `transpileModule`, `createProgram` and `createLanguageService` are all absent — and ts-jest is built entirely on that API. Adopting 7 therefore means replacing the test transformer, which is its own piece of work.
+
 # 1.4.3
  - **Language server** fixed `alias->field` completion going silent for a database once one of its fields shares the alias's own name. `findDBReferences` guarded against re-recording a field by testing `fields[dbCmd]` — the *alias* name — instead of `fields[cmpName]`, the field being added. Normally the alias never matches a field name, the guard is always false and every field is recorded, which is why this went unnoticed. But a reference like `ord->ord` puts a key named `ord` into that database's field map, the guard turns true from then on, and **every subsequent field of that alias is dropped from the index**. Confirmed against a live server: with `ord->ord`, `ord->total` and `ord->status` in one file, completion after `ord->` offered only `ord`; it now offers all three. Closes #17.
 
