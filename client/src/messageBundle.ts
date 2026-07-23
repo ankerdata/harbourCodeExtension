@@ -1,9 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as nls from "vscode-nls";
+import * as l10n from "@vscode/l10n";
 
-const nlsLocalize = nls.loadMessageBundle();
-
+// Not `vscode.l10n.t()`: `debugger.ts` bundles this module and runs outside the
+// extension host, where `vscode` does not exist. Keys are also computed at run
+// time by the formatter webview, so `package.nls*.json` stays the message store
+// and `@vscode/l10n` supplies only the `{0}` substitution.
 interface NlsConfig {
   locale?: string;
 }
@@ -51,7 +53,7 @@ export function localize(
   } else {
     resolvedKey = "Error: '" + resolvedKey + "' not found";
   }
-  return nlsLocalize(resolvedKey, resolvedKey, ...args);
+  return l10n.t(resolvedKey, ...args);
 }
 
 function Init(): void {

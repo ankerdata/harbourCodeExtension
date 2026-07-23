@@ -1,6 +1,16 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.4.2
+ - **Localization** `vscode-nls`, which is in maintenance mode, replaced by `@vscode/l10n`. It was only ever doing the `{0}` placeholder substitution here — the message lookup was already hand-rolled against `package.nls*.json` — so `@vscode/l10n.t()` drops straight into its place. Closes #11.
+
+   The call sites deliberately do **not** move to `vscode.l10n.t()`, for two independent reasons. `debugger.ts` bundles this module and runs as a standalone adapter process where `vscode` does not exist, and `@vscode/l10n` exists precisely for that case. Separately, the formatter webview localizes by *computed* key — it renders the extension's own configuration schema and passes the manifest's `%key%` strings through verbatim — which a literal-message API cannot express. `package.nls*.json` also has to stay regardless, since 46 of its 76 keys localize the manifest itself. Moving the remaining runtime strings into `l10n/bundle.l10n.*.json` would mean two message stores and duplicated translations for no user-visible gain; it only becomes worth revisiting if the webview stops deriving its labels from the manifest (#12).
+
+   The debug adapter bundle shrinks from 59.0 KB to 53.6 KB.
+ - **Localization** `myLocalize.ts` renamed to `messageBundle.ts`, which says what it is: the loader and resolver for the `package.nls*.json` message bundles.
+ - **Tests** 10 tests for the message bundle, which previously had none — key resolution, `%key%` trimming, unknown-key reporting, placeholder substitution, locale selection, and both fallback paths (unknown locale, and a key missing from an otherwise-present locale).
+ - **Build** `isolatedModules` set in both test `tsconfig.json` files. ts-jest warns on every run that hybrid module kinds require it, which started with the move to `node16` in 1.4.1.
+
 # 1.4.1
  - **Language server** `vscode-languageclient` and `vscode-languageserver` upgraded from v8 to **v10.1.0**, moving the wire protocol from LSP 3.17 to 3.18. v10 requires VS Code `^1.91.0`, which the `^1.125.0` floor set in 1.4.0 already clears — the issue asked for v9, but v9 is itself two majors behind, and nothing about the intermediate step was needed. Closes #10.
 
