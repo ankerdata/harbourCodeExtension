@@ -164,6 +164,22 @@ describe("Provider parser", () => {
     });
   });
 
+  describe("alias->field where a field shares the alias name (dbFieldClash.prg)", () => {
+    const p = parseFixture("dbFieldClash.prg");
+
+    it("keeps indexing fields after one matching the alias name", () => {
+      expect(Object.keys(p.databases["ord"].fields).sort()).toEqual([
+        "ord",
+        "status",
+        "total",
+      ]);
+    });
+
+    it("records the casing first seen for a repeated field", () => {
+      expect(p.databases["ord"].fields["total"]).toBe("total");
+    });
+  });
+
   describe("comment association (comments.prg)", () => {
     const p = parseFixture("comments.prg");
 

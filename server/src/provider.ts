@@ -1157,7 +1157,7 @@ export class Provider {
         if (dbCmd !== "field") {
           if (!this.databases[dbCmd])
             this.databases[dbCmd] = { name: dbName, fields: {} };
-          if (!this.databases[dbCmd].fields[dbCmd]) {
+          if (!this.databases[dbCmd].fields[cmpName]) {
             this.databases[dbCmd].fields[cmpName] = match[1];
           }
         }
