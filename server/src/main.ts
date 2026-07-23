@@ -7,6 +7,7 @@ import * as trueCase from "true-case-path";
 import * as server_textdocument from "vscode-languageserver-textdocument";
 import { isHarbourGeneratedCFile } from "./workspaceScan";
 import * as rename from "./rename";
+import * as highlight from "./highlight";
 
 interface FieldInfo {
   name: string;
@@ -124,6 +125,7 @@ connection.onInitialize((params) => {
       workspaceSymbolProvider: true,
       definitionProvider: true,
       referencesProvider: true,
+      documentHighlightProvider: true,
       renameProvider: {
         prepareProvider: true,
       },
@@ -2023,8 +2025,13 @@ connection.onRequest(
 // Resolve the symbol under the cursor and gather all of its occurrences,
 // shared by Find-All-References and Rename. Returns undefined when there is
 // no identifier at the position.
+// `providers` narrows how far occurrences are gathered. Rename and Find All
+// References want the whole workspace; document highlight runs on every caret
+// move and only ever renders the current file, so it passes `{}` to skip the
+// cross-file walk entirely.
 function resolveSymbolAt(
   params: server.TextDocumentPositionParams,
+  providers: Record<string, provider.Provider> = files,
 ): {
   doc: server_textdocument.TextDocument;
   docUri: string;
@@ -2059,7 +2066,7 @@ function resolveSymbolAt(
     next,
     params.position.line,
   );
-  const locations = rename.collectLocations(files, docUri, pThis, scope);
+  const locations = rename.collectLocations(providers, docUri, pThis, scope);
   return {
     doc,
     docUri,
@@ -2075,6 +2082,37 @@ connection.onReferences((params) => {
   const r = resolveSymbolAt(params);
   if (!r) return undefined;
   return r.locations;
+});
+
+connection.onDocumentHighlight((params) => {
+  const r = resolveSymbolAt(params, {});
+  if (!r) return null;
+  const def = r.scope.def;
+  const lineCache = new Map<number, string>();
+  const lineText = (line: number): string => {
+    let text = lineCache.get(line);
+    if (text === undefined) {
+      text = r.doc.getText(
+        server.Range.create(
+          server.Position.create(line, 0),
+          server.Position.create(line, 1e8),
+        ),
+      );
+      lineCache.set(line, text);
+    }
+    return text;
+  };
+  return r.locations.map((loc) => ({
+    range: loc.range,
+    kind: highlight.highlightKind(
+      lineText(loc.range.start.line),
+      loc.range.start.character,
+      r.scope.word.length,
+      def !== undefined &&
+        def.startLine === loc.range.start.line &&
+        def.startCol === loc.range.start.character,
+    ),
+  }));
 });
 
 connection.onPrepareRename((params) => {
