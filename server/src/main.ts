@@ -1910,7 +1910,7 @@ connection.onRequest("harbour/groupAtPosition", (params: any) => {
 
 connection.onRequest("harbour/docSnippet", (params: any) => {
   const doc = documents.get(params.textDocument.uri);
-  if (!doc) return undefined;
+  if (!doc) return null;
   const pp = getDocumentProvider(doc);
   let funcInfo: provider.Info | undefined;
   let iSign: number = -1;
@@ -1924,8 +1924,8 @@ connection.onRequest("harbour/docSnippet", (params: any) => {
       break;
     }
   }
-  if (!funcInfo) return undefined;
-  if (funcInfo.hDocIdx !== undefined) return undefined;
+  if (!funcInfo) return null;
+  if (funcInfo.hDocIdx !== undefined) return null;
   const subParams: provider.Info[] = [];
   for (let iParam = iSign + 1; iParam < pp.funcList.length; iParam++) {
     const subInfo = pp.funcList[iParam];
