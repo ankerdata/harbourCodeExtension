@@ -36,7 +36,7 @@ function WriteDoc(evt: vscode.TextEditorSelectionChangeEvent): void {
   };
   param["eol"] = editor.document.eol;
   client
-    .sendRequest<string | undefined>("harbour/docSnippet", param)
+    .sendRequest<string | null>("harbour/docSnippet", param)
     .then((snippet) => {
       if (snippet) {
         evt.textEditor.insertSnippet(

@@ -27,7 +27,7 @@
     "@vscode/debugadapter": "^1.57.0",
     "@vscode/debugprotocol": "^1.44.0",
     "true-case-path": "^2.2.1",
-    "vscode-languageclient": "^8.0.2",
+    "vscode-languageclient": "^10.1.0",
     "vscode-nls": "^5.2.0"
   },
   "optionalDependencies": {
