@@ -1,6 +1,14 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.5.0
+ - **Language server** added **Document Highlight** support — placing the cursor on an identifier now highlights every occurrence of it in the current file, distinguishing writes from reads. Works for functions, procedures, methods, class members, locals, parameters and statics, honouring the same scoping as Find All References: a routine-local stays inside its routine, a module-static inside its file. Closes #40.
+
+   The occurrence collection is the engine already behind Find All References and Rename (`resolveScope` / `collectLocations`), asked for an empty workspace map so it never walks other files. That matters more here than elsewhere: an editor issues this request on every caret movement, and highlights only ever render in the visible document, so scanning the workspace for them would be wasted on every keystroke.
+
+   Read versus write is derived from the source line, not from the parser. The `reference` records carry no access mode — `howWrite` holds the identifier's original casing, not how it was used — so an occurrence counts as a write when it is the declaration itself, when an assignment follows (`:=`, `+=`, `-=`, `*=`, `/=`, `%=`, `^=`, `**=`), or when it is incremented or decremented on either side (`nTotal++`, `--nTotal`). A bare `=` is treated as a read, since Harbour compares with it and marking every `IF nTotal = 3` as a write would be worse than useless.
+ - **Tests** 13 tests. Nine pin the read/write classifier, including the cases most likely to regress it — bare `=`, the comparison operators `==` `<=` `>=` `!=` `<>`, and `cust->name`, where `->` must not read as `-=`. Four more mirror what the request handler assembles over a fixture: every occurrence of a local found, writes and reads separated line by line, a parameter's declaration marked write against its use as a read, and the result staying inside the current document when other files are present.
+
 # 1.4.4
  - **Build** development dependencies brought up to date: `jest` and `@types/jest` 29 → 30, `esbuild` 0.24 → 0.28, `@vscode/codicons` 0.0.32 → 0.0.45, `@types/node` 18 → 20. `ts-jest` and `@vscode/vsce` needed no manifest change — their existing ranges already covered the newer releases, which is what CI resolves anyway. Closes #20.
 
