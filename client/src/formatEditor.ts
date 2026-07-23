@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
-import { localize } from "./myLocalize";
+import { localize } from "./messageBundle";
 
 declare const v8debug: unknown;
 

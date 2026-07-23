@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { localize } from "./myLocalize";
+import { localize } from "./messageBundle";
 import { getAllWorkspaceFiles } from "./utils";
 
 class HarbourDBGProvider implements vscode.DebugConfigurationProvider {

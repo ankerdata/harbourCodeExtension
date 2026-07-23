@@ -1,4 +1,4 @@
-import { localize, reInit } from "../src/myLocalize";
+import { localize, reInit } from "../src/messageBundle";
 
 // Every test sets its own locale: reInit swaps module-level state, so leaving
 // a previous test's bundle loaded would make these order-dependent.

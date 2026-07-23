@@ -3,7 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import * as cp from "child_process";
 import * as os from "os";
-import { localize } from "./myLocalize";
+import { localize } from "./messageBundle";
 import { getAllWorkspaceFiles } from "./utils";
 
 function resolvePredefinedVariables(v: string): string {

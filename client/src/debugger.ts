@@ -5,7 +5,7 @@ import * as path from "path";
 import * as fs from "fs";
 import * as cp from "child_process";
 import * as trueCase from "true-case-path";
-import { localize, reInit as reInitLocalize } from "./myLocalize";
+import { localize, reInit as reInitLocalize } from "./messageBundle";
 
 const platform = require("os").platform();
 
