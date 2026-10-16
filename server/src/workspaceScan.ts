@@ -64,7 +64,7 @@ export function isHarbourGeneratedCFile(
 
 // stat() that follows symlinks but reports unreadable entries as
 // undefined instead of throwing. Workspace folders routinely contain
-// entries Node cannot stat and one such entry must not take down the 
+// entries Node cannot stat and one such entry must not take down the
 // language server.
 export function tryStat(
   filePath: string,
