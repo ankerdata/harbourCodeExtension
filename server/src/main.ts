@@ -5,7 +5,13 @@ import * as path from "path";
 import { URI as Uri } from "vscode-uri";
 import * as trueCase from "true-case-path";
 import * as server_textdocument from "vscode-languageserver-textdocument";
-import { isHarbourGeneratedCFile } from "./workspaceScan";
+import {
+  isHarbourGeneratedCFile,
+  isScannableDirectory,
+  statDirEntries,
+  tryReadDir,
+  tryStat,
+} from "./workspaceScan";
 import * as rename from "./rename";
 import * as highlight from "./highlight";
 
@@ -226,11 +232,11 @@ function parseWorkspace(): void {
     if (!prgFiles) prgFiles = [];
     fs.readdir(dir, function (_err, ff) {
       if (ff === undefined) return;
-      const files: DirEntry[] = new Array(ff.length);
-      for (let i = 0; i < ff.length; i++) {
-        const completePath = path.join(dir, ff[i]);
-        const info = fs.statSync(completePath);
-        const pathParse = path.parse(ff[i]);
+      const entries = statDirEntries(dir, ff);
+      const files: DirEntry[] = new Array(entries.length);
+      for (let i = 0; i < entries.length; i++) {
+        const { name, completePath, info } = entries[i];
+        const pathParse = path.parse(name);
         pathParse.ext = pathParse.ext.toLowerCase();
         let prgFile: boolean;
         let cFile: boolean;
@@ -244,7 +250,7 @@ function parseWorkspace(): void {
           prgFile = false;
         }
         files[i] = {
-          name: ff[i],
+          name,
           completePath,
           info,
           pathParse,
@@ -281,7 +287,7 @@ function parseWorkspace(): void {
         // 3rd cycle: parse all sub dir
         for (let i = 0; i < files.length; i++) {
           const dest = files[i];
-          if (dest.info.isDirectory()) {
+          if (dest.info.isDirectory() && isScannableDirectory(dest.name)) {
             parseDir(dest.completePath, depth - 1, prgFiles);
           }
         }
@@ -351,8 +357,8 @@ function AddIncludes(startPath: string, includesArray: string[]): void {
     if (fileName.length < 1) return false;
     const completePath = path.join(dir, fileName);
     if (!fs.existsSync(completePath)) return false;
-    const info = fs.statSync(completePath);
-    if (!info.isFile()) return false;
+    const info = tryStat(completePath);
+    if (!info?.isFile()) return false;
     let fileUri = Uri.file(completePath);
     try {
       fileUri = Uri.file(trueCase.trueCasePathSync(completePath));
@@ -399,8 +405,8 @@ function ParseInclude(
     if (!fs.existsSync(dir)) return undefined;
     const test = path.join(dir, includeName);
     if (!fs.existsSync(test)) return undefined;
-    const info = fs.statSync(test);
-    if (!info.isFile()) return undefined;
+    const info = tryStat(test);
+    if (!info?.isFile()) return undefined;
     const pp = new provider.Provider();
     pp.parseString(
       fs.readFileSync(test).toString(),
@@ -1483,16 +1489,17 @@ function completionFiles(
     if (!fs.existsSync(dir)) return;
 
     if (startPath && dir.toLowerCase() === startPath) startDone = true;
-    const ff = fs.readdirSync(dir);
+    const ff = tryReadDir(dir);
     let subFiles: string[];
     const extRE = /\.c?h$/i;
     for (let fi = 0; fi < ff.length; fi++) {
       let fileName = ff[fi];
       if (process.platform.startsWith("win")) fileName = fileName.toLowerCase();
       const completePath = path.join(dir, ff[fi]);
-      const info = fs.statSync(completePath);
+      const info = tryStat(completePath);
+      if (!info) continue;
       if (info.isDirectory()) {
-        subFiles = fs.readdirSync(completePath);
+        subFiles = tryReadDir(completePath);
         if (!allFiles && subFiles.findIndex((v) => extRE.test(v)) === -1)
           continue;
       } else if (!allFiles && !extRE.test(ff[fi])) continue;

@@ -61,3 +61,57 @@ export function isHarbourGeneratedCFile(
     }
   }
 }
+
+// stat() that follows symlinks but reports unreadable entries as
+// undefined instead of throwing. Workspace folders routinely contain
+// entries Node cannot stat and one such entry must not take down the 
+// language server.
+export function tryStat(
+  filePath: string,
+  statFn: (p: string) => fs.Stats = fs.statSync,
+): fs.Stats | undefined {
+  try {
+    return statFn(filePath);
+  } catch {
+    return undefined;
+  }
+}
+
+export function tryReadDir(
+  dir: string,
+  readDirFn: (p: string) => string[] = (p) => fs.readdirSync(p),
+): string[] {
+  try {
+    return readDirFn(dir);
+  } catch {
+    return [];
+  }
+}
+
+export interface ScannedEntry {
+  name: string;
+  completePath: string;
+  info: fs.Stats;
+}
+
+// Stats each name in `dir`, dropping entries that cannot be stat'ed.
+export function statDirEntries(
+  dir: string,
+  names: string[],
+  statFn: (p: string) => fs.Stats = fs.statSync,
+): ScannedEntry[] {
+  const entries: ScannedEntry[] = [];
+  for (const name of names) {
+    const completePath = path.join(dir, name);
+    const info = tryStat(completePath, statFn);
+    if (info) entries.push({ name, completePath, info });
+  }
+  return entries;
+}
+
+// Hidden directories (.git, .vscode, .venv-*, ...) and node_modules
+// hold tooling state and third-party trees, never Harbour sources, and
+// are where unreadable symlinks and huge file counts tend to live.
+export function isScannableDirectory(name: string): boolean {
+  return !name.startsWith(".") && name !== "node_modules";
+}
