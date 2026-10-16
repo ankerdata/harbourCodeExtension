@@ -1,6 +1,11 @@
 # Change Log
 All notable changes to the "Harbour and xHarbour" extension will be documented in this file.
 
+# 1.5.1
+ - **Language server** no longer crashes when the workspace contains an entry it cannot stat. The workspace scan called `fs.statSync` on every directory entry from inside an async `readdir` callback, so a single EACCES or ENOENT went uncaught and killed the server; after five restarts VS Code gave up on it. The reported case was a Linux Python venv on Windows, whose WSL `lib64` symlink is unreadable there, and a dangling symlink or junction does the same. Unreadable entries are now skipped. The include-file lookups and include-path completion had the same unguarded calls and are fixed too: one ran inside a `.then()`, so it would also have brought the server down. Closes #73.
+ - **Language server** the workspace scan no longer descends into hidden directories (`.git`, `.vscode`, `.venv-*`, …) or `node_modules`. They hold tooling state and third-party trees rather than Harbour sources, and they are where unreadable symlinks and large file counts tend to be.
+ - **Tests** 10 tests over the new scan helpers: injected EACCES for both stat and readdir, a directory where one entry fails while the rest are kept, a real dangling junction on disk, and the directory skip rules.
+
 # 1.5.0
  - **Language server** added **Document Highlight** support — placing the cursor on an identifier now highlights every occurrence of it in the current file, distinguishing writes from reads. Works for functions, procedures, methods, class members, locals, parameters and statics, honouring the same scoping as Find All References: a routine-local stays inside its routine, a module-static inside its file. Closes #40.
 

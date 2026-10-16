@@ -1,9 +1,15 @@
+import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import {
   isHarbourSourceFile,
   hasCArtefactExtension,
   isHarbourGeneratedCContent,
   isHarbourGeneratedCFile,
+  isScannableDirectory,
+  statDirEntries,
+  tryReadDir,
+  tryStat,
 } from "../src/workspaceScan";
 
 const fixtureDir = path.join(__dirname, "fixtures");
@@ -104,5 +110,113 @@ describe("workspaceScan.isHarbourGeneratedCFile", () => {
   it("returns false for a non-existent file (fail open: treat as hand-written)", () => {
     const p = path.join(fixtureDir, "this-file-does-not-exist-xyz.c");
     expect(isHarbourGeneratedCFile(p)).toBe(false);
+  });
+});
+
+function fsError(
+  code: string,
+  syscall: string,
+  p: string,
+): NodeJS.ErrnoException {
+  const err: NodeJS.ErrnoException = new Error(`${code}: ${syscall} '${p}'`);
+  err.code = code;
+  err.syscall = syscall;
+  err.path = p;
+  return err;
+}
+
+describe("workspaceScan.tryStat", () => {
+  it("returns stats for a readable file", () => {
+    const info = tryStat(path.join(fixtureDir, "class.prg"));
+    expect(info?.isFile()).toBe(true);
+  });
+
+  it("returns undefined for a missing path", () => {
+    expect(tryStat(path.join(fixtureDir, "missing-xyz"))).toBeUndefined();
+  });
+
+  it("returns undefined instead of throwing on EACCES", () => {
+    const statFn = (p: string): fs.Stats => {
+      throw fsError("EACCES", "stat", p);
+    };
+    expect(tryStat("/proj/.venv-linux-3.13/lib64", statFn)).toBeUndefined();
+  });
+});
+
+describe("workspaceScan.tryReadDir", () => {
+  it("lists a readable directory", () => {
+    expect(tryReadDir(fixtureDir)).toContain("class.prg");
+  });
+
+  it("returns [] instead of throwing on EACCES", () => {
+    const readDirFn = (p: string): string[] => {
+      throw fsError("EACCES", "scandir", p);
+    };
+    expect(tryReadDir("/proj/locked", readDirFn)).toEqual([]);
+  });
+});
+
+describe("workspaceScan.statDirEntries", () => {
+  it("skips entries that cannot be stat'ed and keeps the rest", () => {
+    const dir = "/proj";
+    const fileStats = fs.statSync(path.join(fixtureDir, "class.prg"));
+    const statFn = (p: string): fs.Stats => {
+      if (path.basename(p) === "lib64") throw fsError("EACCES", "stat", p);
+      return fileStats;
+    };
+    const entries = statDirEntries(
+      dir,
+      ["main.prg", "lib64", "util.prg"],
+      statFn,
+    );
+    expect(entries.map((e) => e.name)).toEqual(["main.prg", "util.prg"]);
+    expect(entries[0].completePath).toBe(path.join(dir, "main.prg"));
+    expect(entries[0].info).toBe(fileStats);
+  });
+
+  describe("on a real directory", () => {
+    let tmp: string;
+    beforeEach(() => {
+      tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hb-scan-"));
+      fs.writeFileSync(path.join(tmp, "main.prg"), "PROCEDURE Main()\nRETURN\n");
+    });
+    afterEach(() => {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+
+    it("skips a dangling symlink", () => {
+      try {
+        fs.symlinkSync(
+          path.join(tmp, "nowhere"),
+          path.join(tmp, "broken"),
+          "junction",
+        );
+      } catch {
+        // Symlink creation can be refused on locked-down hosts.
+        return;
+      }
+      const names = fs.readdirSync(tmp);
+      expect(names).toContain("broken");
+      expect(statDirEntries(tmp, names).map((e) => e.name)).toEqual([
+        "main.prg",
+      ]);
+    });
+  });
+});
+
+describe("workspaceScan.isScannableDirectory", () => {
+  it("descends into ordinary source directories", () => {
+    expect(isScannableDirectory("src")).toBe(true);
+    expect(isScannableDirectory("sharedx")).toBe(true);
+  });
+
+  it("skips hidden directories such as Python venvs and VCS metadata", () => {
+    expect(isScannableDirectory(".venv-linux-3.13")).toBe(false);
+    expect(isScannableDirectory(".git")).toBe(false);
+    expect(isScannableDirectory(".vscode")).toBe(false);
+  });
+
+  it("skips node_modules", () => {
+    expect(isScannableDirectory("node_modules")).toBe(false);
   });
 });
